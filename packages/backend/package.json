@@ -1,0 +1,44 @@
+{
+  "name": "@context/backend",
+  "version": "0.1.0",
+  "description": "Fastify backend for the Context app. Postgres persistence, bearer-token auth, LLM-driven spec authoring.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "drizzle",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "start": "node dist/index.js",
+    "dev": "node --watch --enable-source-maps dist/index.js",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node dist/db/migrate.js",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@context/spec-schema": "workspace:*",
+    "drizzle-orm": "^0.40.0",
+    "fastify": "^5.1.0",
+    "pg": "^8.14.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "drizzle-kit": "^0.31.0",
+    "pino-pretty": "^11.3.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
