@@ -3,6 +3,7 @@ import { loadConfig } from '../src/config.js'
 
 const baseEnv = {
   CONTEXT_PG_PASSWORD: 'secret',
+  CONTEXT_ADMIN_TOKEN: 'a'.repeat(32),
 }
 
 describe('loadConfig', () => {
@@ -41,5 +42,12 @@ describe('loadConfig', () => {
 
   it('rejects an out-of-range port', () => {
     expect(() => loadConfig({ ...baseEnv, CONTEXT_PORT: '70000' })).toThrow()
+  })
+
+  it('requires CONTEXT_ADMIN_TOKEN and enforces min length', () => {
+    expect(() => loadConfig({ CONTEXT_PG_PASSWORD: 'secret' })).toThrow(/CONTEXT_ADMIN_TOKEN/)
+    expect(() =>
+      loadConfig({ CONTEXT_PG_PASSWORD: 'secret', CONTEXT_ADMIN_TOKEN: 'short' }),
+    ).toThrow(/CONTEXT_ADMIN_TOKEN/)
   })
 })
