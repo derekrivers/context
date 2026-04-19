@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: context
+          POSTGRES_PASSWORD: context
+          POSTGRES_DB: context
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U context -d context"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      CONTEXT_NODE_ENV: test
+      CONTEXT_PG_HOST: localhost
+      CONTEXT_PG_PORT: "5432"
+      CONTEXT_PG_USER: context
+      CONTEXT_PG_PASSWORD: context
+      CONTEXT_PG_DATABASE: context
+      CONTEXT_PG_SSL: "false"
+      CONTEXT_ADMIN_TOKEN: ci-admin-token-0123456789abcdef
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Apply DB migrations
+        if: hashFiles('packages/backend/package.json') != ''
+        run: pnpm --filter @context/backend db:migrate
+
+      - name: Run tests
+        run: pnpm test
