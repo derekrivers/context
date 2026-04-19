@@ -18,6 +18,7 @@ function testConfig(): AppConfig {
       ssl: false,
       poolMax: 10,
     },
+    adminToken: 'test-admin-token-0123456789',
   }
 }
 

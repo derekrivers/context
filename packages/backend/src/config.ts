@@ -21,6 +21,9 @@ const ConfigSchema = z.object({
   CONTEXT_PG_DATABASE: z.string().default('context'),
   CONTEXT_PG_SSL: BoolString.default('false'),
   CONTEXT_PG_POOL_MAX: PositiveInt.default(10),
+  CONTEXT_ADMIN_TOKEN: z
+    .string()
+    .min(16, 'CONTEXT_ADMIN_TOKEN must be at least 16 characters'),
 })
 
 export type AppConfig = {
@@ -37,6 +40,7 @@ export type AppConfig = {
     ssl: boolean
     poolMax: number
   }
+  adminToken: string
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -60,5 +64,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ssl: v.CONTEXT_PG_SSL,
       poolMax: v.CONTEXT_PG_POOL_MAX,
     },
+    adminToken: v.CONTEXT_ADMIN_TOKEN,
   }
 }
