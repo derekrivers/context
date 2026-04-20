@@ -44,7 +44,7 @@ export async function probePostgres(config: AppConfig): Promise<boolean> {
 
 export async function resetTables(db: Db): Promise<void> {
   await db.pool.query(
-    'TRUNCATE context.conversation_turns, context.spec_history, context.specs, context.users RESTART IDENTITY CASCADE',
+    'TRUNCATE context.conversation_turns, context.spec_history, context.spec_shares, context.specs, context.users RESTART IDENTITY CASCADE',
   )
 }
 

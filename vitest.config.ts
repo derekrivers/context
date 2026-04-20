@@ -4,5 +4,6 @@ export default defineConfig({
   test: {
     include: ['packages/*/tests/**/*.test.ts'],
     environment: 'node',
+    fileParallelism: false,
   },
 })
