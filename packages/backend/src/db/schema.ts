@@ -79,23 +79,27 @@ export const specShares = contextSchema.table(
 export const conversationTurns = contextSchema.table(
   'conversation_turns',
   {
-    id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+    id: uuid('id').primaryKey().defaultRandom(),
     specId: uuid('spec_id')
       .notNull()
       .references(() => specs.id, { onDelete: 'cascade' }),
-    turnNumber: integer('turn_number').notNull(),
-    targetField: text('target_field').notNull(),
-    question: text('question'),
-    userAnswer: text('user_answer'),
-    fieldUpdate: jsonb('field_update'),
-    modelId: text('model_id'),
-    inputTokens: integer('input_tokens'),
-    outputTokens: integer('output_tokens'),
-    stateSnapshot: jsonb('state_snapshot').notNull(),
+    turnIndex: integer('turn_index').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    phase: text('phase', {
+      enum: ['selection', 'answer', 'clarification', 'skip', 'unskip'],
+    }).notNull(),
+    targetPath: text('target_path'),
+    targetSection: text('target_section'),
+    selectionReason: jsonb('selection_reason'),
+    specSnapshot: jsonb('spec_snapshot'),
+    completenessSnapshot: jsonb('completeness_snapshot'),
+    outcome: text('outcome'),
+    llmModelId: text('llm_model_id'),
+    llmTokensIn: integer('llm_tokens_in'),
+    llmTokensOut: integer('llm_tokens_out'),
   },
   (t) => ({
-    specTurnUnique: unique('conversation_turns_spec_turn_unique').on(t.specId, t.turnNumber),
+    specTurnUnique: unique('conversation_turns_spec_turn_unique').on(t.specId, t.turnIndex),
   }),
 )
 

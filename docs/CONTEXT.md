@@ -268,11 +268,267 @@ If you find yourself wanting to add any of the following, **stop and push back**
 - Audit log beyond `granted_at` / `granted_by`
 
 
-### T-05 — Conversation state machine
+# T-05 — Conversation State Machine
 
-Pure backend logic. `nextTurn(specId)` returns `{ targetField, context }` — the highest-priority missing field whose dependencies are satisfied, or `null` if the spec is sufficiently complete. Field priority follows schema `importance` annotations (intent > domain_model > capabilities > flows > constraints > references). Dependency rule: a capability cannot be asked about before at least one entity exists. Every call persists a row in `context.conversation_turns` with the state snapshot. Pure function of spec state plus recorded turns.
+You are implementing ticket **T-05** in the Context MVP build plan. This ticket is the heart of the conversation loop: the deterministic logic that decides what the LLM should ask next. The LLM does not make this decision — it only phrases the question (T-06) and parses the answer (T-06). This ticket owns "what to ask."
 
-**Done when:** given a spec at any point in its lifecycle, the engine selects the next field deterministically and sensibly.
+This ticket depends on T-01 (schema), T-02 (DB), T-03 (auth), T-04 (spec CRUD). It does not depend on T-04a (sharing) or anything later.
+
+---
+
+## Context
+
+- **Schema (from T-01):** `@context/spec-schema` exports Zod types, `createEmptySpec()`, and `computeCompleteness(spec)`. Every field carries an `importance` annotation. Fields can be marked `unknown` with a reason.
+- **DB (from T-02):** `context.specs`, `context.spec_history`, `context.conversation_turns` tables exist.
+- **Next consumer (T-06):** `phraseQuestion(targetField, specContext, conversationSoFar)` will consume what this ticket returns. The shape of `targetField` and `context` is a contract with T-06.
+
+---
+
+## Architectural split: pure selector + impure recorder
+
+The original ticket wording said "pure function … persists a row." Those are incompatible. Split them:
+
+### `selectNextField(spec, turns): Selection | null` — **pure**
+
+- No DB, no IO, no clock, no randomness.
+- Takes the full spec and the ordered list of prior turns for that spec as inputs.
+- Returns a `Selection` object or `null`.
+- Lives in `@context/backend/src/conversation/selector.ts`.
+- Exhaustively unit-testable against fixtures.
+
+### `nextTurn(specId): Promise<Selection | null>` — impure wrapper
+
+- Loads spec from `context.specs`.
+- Loads turns from `context.conversation_turns` for this spec, ordered by `turn_index` ascending.
+- Calls `selectNextField`.
+- Persists a new row in `context.conversation_turns` capturing what was selected (see **Turn recording** below).
+- Returns the same `Selection` to the caller.
+- Lives in `@context/backend/src/conversation/engine.ts`.
+
+The HTTP layer calls `nextTurn`. T-06 (`phraseQuestion`) receives the `Selection` from the HTTP layer, not by importing the selector. Keep the boundary clean.
+
+---
+
+## Return type
+
+```ts
+type Selection = {
+  targetField: FieldRef;
+  context: SelectionContext;
+  reason: SelectionReason;
+};
+
+type FieldRef = {
+  path: string;         // JSONPath-ish dotted path, e.g. "domain_model.entities[0].fields[2].type"
+  section: Section;     // "intent" | "domain_model" | "capabilities" | "flows" | "constraints" | "references"
+  schemaRef: string;    // reference into the Zod schema registry so T-06 can recover field metadata
+  importance: Importance; // "critical" | "high" | "medium" | "low"
+};
+
+type SelectionContext = {
+  // Everything T-06 needs to phrase a good question without re-reading the spec.
+  surroundingSpec: unknown;   // the parent object of targetField, for context
+  relatedFields: FieldRef[];  // siblings or referenced fields that inform phrasing
+  recentTurns: TurnSummary[]; // last 3 turns, for conversational continuity
+};
+
+type SelectionReason =
+  | { kind: "highest_priority_unblocked" }
+  | { kind: "retry_after_clarification"; previousTurnId: string }
+  | { kind: "user_unskipped"; previousSkipTurnId: string };
+
+type TurnSummary = {
+  turnId: string;
+  targetPath: string;
+  outcome: "answered" | "clarification_requested" | "skipped" | "unparseable";
+};
+```
+
+If the spec is complete enough to stop (see **Completeness threshold**), `nextTurn` returns `null` and the HTTP layer responds with 200 and an empty body, or 204 — pick one and be consistent.
+
+---
+
+## Selection algorithm
+
+Given `spec` and `turns`, compute the next selection as follows:
+
+1. **Build the candidate set.** Walk the spec schema and enumerate every field that is currently "missing." A field is missing iff:
+   - It is absent or null in the spec, **OR**
+   - It is present but explicitly marked `unknown` AND `turns` contains no prior turn where this exact path was answered with an `unknown` acknowledgement.
+   
+   In other words: a user saying "I don't know, and here's why" satisfies the field for this session. A field that is just structurally empty does not.
+
+2. **Filter by dependencies.** Drop candidates whose dependencies are unmet. See **Dependency rules** below.
+
+3. **Filter by recent activity.** Drop candidates where the most recent turn on this exact path had outcome `skipped` within the last 5 turns. The user explicitly said "not now"; respect it for a window. After 5 turns, the field becomes eligible again.
+
+4. **Filter by retry budget.** Drop candidates where this path has been asked 3+ times with `unparseable` or `clarification_requested` outcomes. The engine has given up on this field; it surfaces in `unresolved_questions` (handled by T-08), not here.
+
+5. **Handle retry priority.** If the most recent turn was a `clarification_requested` outcome for some path, and that path is still in the candidate set after steps 2–4, return it immediately with `reason: "retry_after_clarification"`. The conversation stays focused until the clarification resolves or the retry budget is exhausted.
+
+6. **Handle unskip.** If any turn has outcome `skipped` and the user has since issued an "unskip" turn for that path (recorded as `outcome: "unskipped"` — see **Skip and unskip** below), prioritise that path with `reason: "user_unskipped"`.
+
+7. **Rank remaining candidates.** Sort by:
+   - Section priority: `intent` > `domain_model` > `capabilities` > `flows` > `constraints` > `references`. (These map 1→6.)
+   - Within section, by field `importance`: `critical` > `high` > `medium` > `low`.
+   - Tie-breaker: schema declaration order. Two fields of equal section and importance resolve by whichever appears first in the Zod schema traversal. This is deterministic because Zod's `shape` iteration order is stable.
+
+8. **Return the top candidate** wrapped in a `Selection` with `reason: "highest_priority_unblocked"`.
+
+9. **If the candidate set is empty after all filters,** evaluate the completeness threshold. If met, return `null`. If not met, return the highest-importance field that was dropped by the retry budget filter — the conversation is stuck, and the HTTP response should surface this so the UI can prompt the user to resolve it manually. Include `reason: "retry_after_clarification"` with the latest previous turn id.
+
+---
+
+## Dependency rules
+
+Encode these as a declarative table in `@context/backend/src/conversation/dependencies.ts`. Do not scatter the rules through the selector.
+
+- `capabilities.*` depends on `domain_model.entities` having at least one entry.
+- `capabilities[i].acceptance_criteria` depends on `capabilities[i]` having a name and verb.
+- `flows.*` depends on `capabilities` having at least one entry with a name.
+- `flows[i].steps[j]` depends on `flows[i]` having a trigger.
+- `domain_model.entities[i].relationships` depends on `domain_model.entities` having at least two entries.
+- `constraints.*` has no dependencies — a user can specify constraints at any time.
+- `references.*` has no dependencies.
+- `intent.*` has no dependencies — it is always eligible and always highest priority when missing.
+
+No other dependencies for v0.1. If during implementation you feel you need another rule, stop and flag it rather than adding it silently.
+
+---
+
+## Completeness threshold
+
+Use `computeCompleteness(spec)` from T-01. `selectNextField` returns `null` when **all** of the following are true:
+
+- `intent` section score ≥ 0.95
+- `domain_model` section score ≥ 0.80
+- `capabilities` section score ≥ 0.80
+- `flows` section score ≥ 0.60
+- `constraints` section score ≥ 0.60
+- `references` section score ≥ 0.20
+
+These are starting thresholds. Expose them as named constants in `selector.ts` — do not hardcode numbers in the algorithm body. They will be tuned based on real-spec feedback and need to be easy to adjust.
+
+Rationale to preserve in a comment: intent and domain model must be nearly complete because everything downstream depends on them; flows and constraints can be thinner because they are often naturally incomplete at spec time; references is optional for most specs.
+
+---
+
+## Turn recording
+
+Every call to `nextTurn` persists a row in `context.conversation_turns` with these columns (augment the T-02 migration with any missing columns as a follow-on migration — do not edit T-02's migration in place):
+
+- `id` (uuid pk)
+- `spec_id` (uuid fk)
+- `turn_index` (int, per-spec monotonic, 0-based)
+- `created_at` (timestamptz)
+- `phase` (text: `"selection"` | `"answer"` | `"clarification"` | `"skip"` | `"unskip"`)
+- `target_path` (text, nullable — null when `phase = null` i.e. spec complete)
+- `target_section` (text, nullable)
+- `selection_reason` (jsonb, nullable — serialised `SelectionReason`)
+- `spec_snapshot` (jsonb — full spec at time of selection)
+- `completeness_snapshot` (jsonb — output of `computeCompleteness`)
+- `outcome` (text, nullable — populated when an answer turn resolves a prior selection turn)
+- `llm_model_id` (text, nullable — populated by T-06)
+- `llm_tokens_in` (int, nullable)
+- `llm_tokens_out` (int, nullable)
+
+`nextTurn` creates a `phase: "selection"` row. T-06's answer handling creates `phase: "answer"` rows and back-fills the `outcome` on the matching selection row by `spec_id + target_path` pair.
+
+Recording turns must not fail silently. If the insert fails, the whole `nextTurn` call fails with a 500 — better to fail loudly than return a selection that nothing knows about.
+
+---
+
+## Skip and unskip
+
+These are first-class behaviours of the conversation, not edge cases. The user needs a "skip this question" affordance in the UI (T-08 will wire it), and the engine needs to respect it.
+
+- **Skip.** The HTTP layer exposes `POST /specs/:id/turns/:turnId/skip`. This records a `phase: "skip"` turn with `outcome: "skipped"` against the target path. Next `nextTurn` call filters this path out per step 3 above.
+- **Unskip.** `POST /specs/:id/turns/skip` with `{ path: string }` in the body (or delete the skip — pick one shape). Records a `phase: "unskip"` turn. Next `nextTurn` call promotes this path per step 6.
+
+Skip and unskip are not in the selector's return path — the selector only reads their effects via `turns`. But the HTTP routes belong to this ticket since they exist to feed the state machine.
+
+---
+
+## HTTP surface
+
+Add to `@context/backend`:
+
+- `POST /specs/:id/turns/next` — calls `nextTurn(specId)`. Returns the `Selection` or 204 if null. Auth: caller must be owner or have an `editor` share (once T-04a lands; until then, owner only).
+- `POST /specs/:id/turns/:turnId/skip` — records a skip turn.
+- `POST /specs/:id/turns/unskip` — records an unskip turn for a given path.
+- `GET /specs/:id/turns` — returns the turn history for debugging and for T-08's right pane.
+
+All endpoints are JSON, bearer-token authed, and follow existing Fastify handler conventions.
+
+---
+
+## Tests
+
+Unit tests for the pure selector are the primary defence. They should live in `@context/backend/src/conversation/selector.test.ts` and cover:
+
+- Empty spec → returns `intent.summary` (highest priority, no dependencies).
+- Intent filled, domain model empty → returns `domain_model.entities`.
+- Domain model has one entity, no capabilities → next target is a capability field, not a relationship (needs 2+ entities).
+- Domain model has two entities → relationship fields become eligible.
+- Field marked `unknown` with a reason after a prior turn → not re-selected.
+- Field marked `unknown` with no prior turn → still selected (treated as missing).
+- Skipped field within 5-turn window → filtered out.
+- Skipped field after 5+ turns → eligible again.
+- 3 unparseable turns on same path → field drops out, not re-asked.
+- All sections above threshold → returns `null`.
+- All sections above threshold except `references` at 0.15 → returns `null` (references threshold is 0.20, but section-by-section — verify the precise logic you implement here matches the stated thresholds).
+- Deterministic tie-breaking: two fixtures with identical importance fields resolve in schema order, reproducibly across runs.
+
+Integration tests for `nextTurn` cover:
+
+- Turn row is persisted with correct snapshot.
+- Failed DB write surfaces as 500, not a silent success.
+- `turn_index` is monotonic per spec.
+- Skip → next → unskip → next sequence behaves as specified.
+
+---
+
+## Done when
+
+- `selectNextField` is pure, fully unit-tested, and passes all fixtures above.
+- `nextTurn` persists turns correctly and is covered by integration tests.
+- `POST /specs/:id/turns/next` returns sensible selections on a hand-built fixture spec walked through 10+ turns.
+- Skip and unskip behave as specified.
+- Given any spec state, running `nextTurn` twice in succession with no intervening spec mutation returns the same `targetField` (determinism check).
+- The full traversal from empty spec → threshold-met takes somewhere in the region of 25–50 turns on a realistic CRUD-app fixture. If it takes 200, the thresholds or the candidate set generation are wrong.
+
+---
+
+## Non-negotiables
+
+- The selector is pure. No DB imports. No `Date.now()`. No `Math.random()`. If you need the current time, it is an explicit parameter.
+- Thresholds are named constants, not literals in conditionals.
+- Dependency rules live in a declarative table, not scattered through branching code.
+- Every turn records a spec snapshot. Storage is cheap; debugging a selection that went wrong three turns ago without the snapshot is not.
+- TypeScript strict. Zod-validate request bodies on all new HTTP routes.
+- No new env vars.
+
+---
+
+## Out of scope
+
+Flag and push back if asked to add any of these:
+
+- LLM-driven selection ("let the model decide what to ask next"). The whole point of this ticket is that the model doesn't decide.
+- Contradiction detection (explicit v0.1 non-goal).
+- Branching conversation trees based on user persona.
+- Multi-spec context (asking questions informed by other specs the user has authored).
+- Resuming a conversation in a different order than the selector dictates — if the user wants to fill fields out of order, they edit the spec pane directly (T-08), which is a different code path entirely.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description so I can sanity-check:
+
+- Whether `nextTurn` returning "no selection but spec not complete" (step 9) is a 200 with a structured body or a distinct status code. Pick one and be consistent.
+- Exact shape of `SelectionContext.surroundingSpec` — how much of the parent do you include? Default to the immediate parent object; if T-06 needs more, it can ask for it.
+- Whether skip/unskip endpoints live under `/turns/` or `/fields/`. I used `/turns/` above but `/fields/` might read better. Your call.
 
 ### T-06 — LLM adapters: phrase + parse
 
