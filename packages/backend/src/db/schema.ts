@@ -86,7 +86,7 @@ export const conversationTurns = contextSchema.table(
     turnIndex: integer('turn_index').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     phase: text('phase', {
-      enum: ['selection', 'answer', 'clarification', 'skip', 'unskip'],
+      enum: ['selection', 'answer', 'clarification', 'skip', 'unskip', 'direct_edit', 'retry_request'],
     }).notNull(),
     targetPath: text('target_path'),
     targetSection: text('target_section'),

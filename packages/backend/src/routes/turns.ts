@@ -338,6 +338,7 @@ export const turnRoutes: FastifyPluginAsync<TurnRoutesOptions> = async (
             authorId: user.id,
             updates: parseResult.updates,
             now: nowFn,
+            writeDirectEditTurns: false,
           })
         } catch (err) {
           if (err instanceof SpecApplyError) {

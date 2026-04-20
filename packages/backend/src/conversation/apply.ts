@@ -1,7 +1,7 @@
-import { eq } from 'drizzle-orm'
-import { CanonicalSpecSchema, type CanonicalSpec } from '@context/spec-schema'
+import { asc, eq } from 'drizzle-orm'
+import { CanonicalSpecSchema, computeCompleteness, type CanonicalSpec } from '@context/spec-schema'
 import type { Db } from '../db/pool.js'
-import { specHistory, specs, type Spec } from '../db/schema.js'
+import { conversationTurns, specHistory, specs, type Spec } from '../db/schema.js'
 import { computeDiff } from '../lib/diff.js'
 import type { FieldUpdate } from './parse.js'
 
@@ -68,11 +68,18 @@ export interface ApplyUpdatesInput {
   authorId: string
   updates: FieldUpdate[]
   now?: () => Date
+  /** If true (the default), writes one direct_edit turn per changed path. */
+  writeDirectEditTurns?: boolean
 }
 
 export interface ApplyUpdatesResult {
   spec: CanonicalSpec
   row: Spec
+}
+
+function sectionFromPath(path: string): string {
+  const head = path.split(/[.[]/)[0] ?? ''
+  return head
 }
 
 export async function applyFieldUpdates(
@@ -144,6 +151,35 @@ export async function applyFieldUpdates(
     specJsonAfter: nextSpecValidated,
     createdAt: now,
   })
+
+  if (input.writeDirectEditTurns !== false) {
+    const report = computeCompleteness(nextSpecValidated)
+    const bySection: Record<string, number> = {}
+    for (const [k, v] of Object.entries(report.bySection)) bySection[k] = v.score
+    const completenessSnapshot = { overall: report.overall, by_section: bySection }
+
+    const existing = await db.client
+      .select({ turnIndex: conversationTurns.turnIndex })
+      .from(conversationTurns)
+      .where(eq(conversationTurns.specId, specId))
+      .orderBy(asc(conversationTurns.turnIndex))
+    let nextIndex = existing.length === 0 ? 0 : existing[existing.length - 1]!.turnIndex + 1
+
+    for (const u of updates) {
+      await db.client.insert(conversationTurns).values({
+        specId,
+        turnIndex: nextIndex,
+        phase: 'direct_edit',
+        targetPath: u.path,
+        targetSection: sectionFromPath(u.path),
+        outcome: 'answered',
+        specSnapshot: nextSpecValidated,
+        completenessSnapshot,
+        createdAt: now,
+      })
+      nextIndex += 1
+    }
+  }
 
   return { spec: nextSpecValidated, row: nextRow }
 }

@@ -185,7 +185,7 @@ function AuthoringRoute(): JSX.Element {
         <AuthoringLayout
           header={header}
           conversation={<ConversationPane specId={id} />}
-          structured={<StructuredPane />}
+          structured={<StructuredPane specId={id} />}
           context={<ContextPane />}
         />
       </AuthoringProvider>

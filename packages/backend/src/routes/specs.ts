@@ -1,4 +1,4 @@
-import { and, desc, eq, isNotNull, or } from 'drizzle-orm'
+import { and, asc, desc, eq, isNotNull, or } from 'drizzle-orm'
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import {
@@ -11,6 +11,7 @@ import {
 } from '@context/spec-schema'
 import type { Db } from '../db/pool.js'
 import {
+  conversationTurns,
   specHistory,
   specShares,
   specs,
@@ -334,6 +335,41 @@ export const specRoutes: FastifyPluginAsync<SpecRoutesOptions> = async (
       specJsonAfter: nextSpec,
       createdAt: now,
     })
+
+    // direct_edit turn per changed path (excluding server-managed meta fields)
+    const META_FIELDS = new Set(['updated_at', 'created_at', 'id', 'schema_version'])
+    const changedPaths = diff.changes
+      .map((c) => c.path)
+      .filter((p) => p !== '$' && !META_FIELDS.has(p))
+    if (changedPaths.length > 0) {
+      const report = computeCompleteness(nextSpec)
+      const bySection: Record<string, number> = {}
+      for (const [k, v] of Object.entries(report.bySection)) bySection[k] = v.score
+      const completenessSnapshot = { overall: report.overall, by_section: bySection }
+
+      const existing = await db.client
+        .select({ turnIndex: conversationTurns.turnIndex })
+        .from(conversationTurns)
+        .where(eq(conversationTurns.specId, nextRow.id))
+        .orderBy(asc(conversationTurns.turnIndex))
+      let nextIndex = existing.length === 0 ? 0 : existing[existing.length - 1]!.turnIndex + 1
+
+      for (const path of changedPaths) {
+        const section = path.split(/[.[]/)[0] ?? ''
+        await db.client.insert(conversationTurns).values({
+          specId: nextRow.id,
+          turnIndex: nextIndex,
+          phase: 'direct_edit',
+          targetPath: path,
+          targetSection: section,
+          outcome: 'answered',
+          specSnapshot: nextSpec,
+          completenessSnapshot,
+          createdAt: now,
+        })
+        nextIndex += 1
+      }
+    }
 
     reply.send(serializeSpec(nextRow))
   })
