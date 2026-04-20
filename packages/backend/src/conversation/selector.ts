@@ -307,9 +307,20 @@ function isSkippedRecently(path: string, turns: SelectorTurn[]): boolean {
 }
 
 function isRetryExhausted(path: string, turns: SelectorTurn[]): boolean {
+  // A retry_request turn for this path resets the count. Only count bad
+  // outcomes that occurred *after* the most recent retry_request.
+  let lastRetryIndex = -1
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i]!
+    if (t.phase === 'retry_request' && t.targetPath === path) {
+      lastRetryIndex = t.turnIndex
+      break
+    }
+  }
   const bad = turns.filter(
     (t) =>
       t.targetPath === path &&
+      t.turnIndex > lastRetryIndex &&
       (t.outcome === 'unparseable' || t.outcome === 'clarification_requested'),
   )
   return bad.length >= RETRY_BUDGET

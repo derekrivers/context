@@ -186,7 +186,37 @@ function AuthoringRoute(): JSX.Element {
           header={header}
           conversation={<ConversationPane specId={id} />}
           structured={<StructuredPane specId={id} />}
-          context={<ContextPane />}
+          context={
+            <ContextPane
+              specId={id}
+              onExport={() => {
+                if (!specQuery.data) return
+                const date = new Date().toISOString().slice(0, 10)
+                const filename = `${specQuery.data.id}-${date}.json`
+                const blob = new Blob(
+                  [JSON.stringify(specQuery.data.spec, null, 2)],
+                  { type: 'application/json' },
+                )
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = filename
+                document.body.appendChild(a)
+                a.click()
+                a.remove()
+                URL.revokeObjectURL(url)
+              }}
+              onJumpConversation={() => {
+                const input = document.querySelector<HTMLTextAreaElement>(
+                  'textarea[aria-label="Your answer"]',
+                )
+                input?.focus()
+              }}
+              onNavigateToPath={() => {
+                // anchor-based scroll is a future refinement; stubbed for now
+              }}
+            />
+          }
         />
       </AuthoringProvider>
     </AuthoringReadOnlyProvider>

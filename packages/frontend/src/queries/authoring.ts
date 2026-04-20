@@ -48,7 +48,15 @@ const LockAcquiredSchema = z.object({
   lock_ttl_ms: z.number(),
 })
 
-const TurnPhaseSchema = z.enum(['selection', 'answer', 'clarification', 'skip', 'unskip'])
+const TurnPhaseSchema = z.enum([
+  'selection',
+  'answer',
+  'clarification',
+  'skip',
+  'unskip',
+  'direct_edit',
+  'retry_request',
+])
 export type TurnPhase = z.infer<typeof TurnPhaseSchema>
 
 const TurnRowSchema = z.object({
@@ -301,6 +309,81 @@ export function useUnskipTurn(specId: string) {
       apiPost(`/specs/${specId}/turns/unskip`, { path }, z.unknown()),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: authoringKeys(specId).turns })
+    },
+  })
+}
+
+const UnresolvedEntrySchema = z.object({
+  path: z.string(),
+  section: z.string().nullable(),
+  last_asked_at: z.string(),
+  last_question: z.string().nullable(),
+  reason: z.enum(['retry_budget_exhausted', 'user_marked_unanswerable']),
+  retries_attempted: z.number(),
+})
+export type UnresolvedEntry = z.infer<typeof UnresolvedEntrySchema>
+
+const UnresolvedListSchema = z.object({
+  entries: z.array(UnresolvedEntrySchema),
+})
+
+export function useUnresolved(specId: string) {
+  return useQuery({
+    queryKey: authoringKeys(specId).unresolved,
+    queryFn: () => apiGet(`/specs/${specId}/unresolved`, UnresolvedListSchema),
+    enabled: specId.length > 0,
+  })
+}
+
+export function useRetryField(specId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (path: string) =>
+      apiPost(
+        `/specs/${specId}/fields/retry`,
+        { path },
+        z.object({ path: z.string(), retry_cleared: z.boolean() }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: authoringKeys(specId).unresolved })
+      void qc.invalidateQueries({ queryKey: authoringKeys(specId).turns })
+      void qc.invalidateQueries({ queryKey: authoringKeys(specId).spec })
+    },
+  })
+}
+
+export function useMarkUnanswerable(specId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (vars: { path: string; reason?: string; currentSpec: unknown }) => {
+      const spec = vars.currentSpec as {
+        provenance: { unresolved_questions: Array<{ id: string; path: string; reason: string; state: string; created_at: string }> }
+      }
+      const now = new Date().toISOString()
+      const existing = spec.provenance.unresolved_questions.filter((q) => q.path !== vars.path)
+      const next = {
+        ...spec,
+        provenance: {
+          ...spec.provenance,
+          unresolved_questions: [
+            ...existing,
+            {
+              id: `q_mu_${Date.now()}`,
+              path: vars.path,
+              reason: vars.reason ?? 'user marked as unanswerable',
+              state: 'unanswerable',
+              created_at: now,
+            },
+          ],
+        },
+        updated_at: now,
+      }
+      return apiPatch(`/specs/${specId}`, { spec: next }, SpecDetailSchema)
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: authoringKeys(specId).unresolved })
+      void qc.invalidateQueries({ queryKey: authoringKeys(specId).spec })
+      void qc.invalidateQueries({ queryKey: authoringKeys(specId).completeness })
     },
   })
 }
