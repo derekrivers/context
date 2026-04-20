@@ -1,8 +1,12 @@
+import { sql } from 'drizzle-orm'
 import {
   bigserial,
+  check,
+  index,
   integer,
   jsonb,
   pgSchema,
+  primaryKey,
   text,
   timestamp,
   unique,
@@ -50,6 +54,28 @@ export const specHistory = contextSchema.table('spec_history', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
+export const specShares = contextSchema.table(
+  'spec_shares',
+  {
+    specId: uuid('spec_id')
+      .notNull()
+      .references(() => specs.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    role: text('role', { enum: ['viewer', 'editor'] }).notNull(),
+    grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+    grantedBy: uuid('granted_by')
+      .notNull()
+      .references(() => users.id),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.specId, t.userId] }),
+    userIdx: index('spec_shares_user_id_idx').on(t.userId),
+    roleCheck: check('spec_shares_role_check', sql`${t.role} IN ('viewer', 'editor')`),
+  }),
+)
+
 export const conversationTurns = contextSchema.table(
   'conversation_turns',
   {
@@ -81,3 +107,5 @@ export type SpecHistoryRow = typeof specHistory.$inferSelect
 export type NewSpecHistoryRow = typeof specHistory.$inferInsert
 export type ConversationTurn = typeof conversationTurns.$inferSelect
 export type NewConversationTurn = typeof conversationTurns.$inferInsert
+export type SpecShare = typeof specShares.$inferSelect
+export type NewSpecShare = typeof specShares.$inferInsert

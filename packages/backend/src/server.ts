@@ -3,6 +3,7 @@ import { authPlugin } from './auth/plugin.js'
 import type { AppConfig } from './config.js'
 import { createDb, type Db } from './db/pool.js'
 import { registerHealthRoute } from './routes/health.js'
+import { specRoutes } from './routes/specs.js'
 import { userRoutes } from './routes/users.js'
 
 export interface BuildServerOptions {
@@ -39,6 +40,7 @@ export async function buildServer({ config, db: providedDb }: BuildServerOptions
   await registerHealthRoute(app)
   await app.register(authPlugin, { db, adminToken: config.adminToken })
   await app.register(userRoutes, { db })
+  await app.register(specRoutes, { db })
 
   return app
 }

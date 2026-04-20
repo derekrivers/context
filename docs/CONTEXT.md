@@ -86,6 +86,188 @@ Bearer-token middleware. `context.users` table stores token hashes, never plaint
 
 **Done when:** you can round-trip a spec via curl, and the history table shows the correct diffs.
 
+# T-04a — Spec Sharing
+
+You are implementing ticket **T-04a** in the Context MVP build plan. This ticket closes a scope gap: T-04's `GET /specs` returns "owned + shared" and T-03 distinguishes editor/viewer roles, but no endpoint or table exists to create the share relationship itself.
+
+This ticket must land between T-04 and T-05. T-05 onwards does not depend on sharing, so keep the blast radius small.
+
+---
+
+## Context
+
+- **Repo layout:** monorepo with `@context/backend` (Fastify, Postgres), `@context/spec-schema` (Zod), `@context/frontend` (Vite React) — see the MVP build plan for conventions.
+- **Auth model (from T-03):** bearer tokens, two global roles — `editor` (author, modify, share, export) and `viewer` (read shared specs only). Token hashes live in `context.users`; plaintext is never stored.
+- **Specs model (from T-04):** `context.specs` holds canonical specs with an `owner_id`. Every mutation appends to `context.spec_history`. Pessimistic edit lock via `POST /specs/:id/lock` with a 5-minute lease.
+- **What's missing:** the table and endpoints that make `GET /specs` actually return shared rows, and the UI affordance to create a share.
+
+---
+
+## Scope
+
+### In
+- Migration for `context.spec_shares`.
+- Share CRUD endpoints on the backend.
+- Update to `GET /specs` join logic so shared specs appear for the recipient.
+- Permission enforcement: share role gates write access on `PATCH /specs/:id` and `POST /specs/:id/lock`.
+- UI share modal in the authoring view (T-08 scope extension).
+
+### Out
+- Email/handle-based invites. Share by `user_id` only for v0.1 — the owner must know the recipient's id. Invite flows wait until there is a second human in the loop.
+- Share links, public specs, org-level sharing.
+- Notification of share grants (no email, no in-app toast for the recipient beyond the spec appearing in their list).
+- Share history or audit beyond the `granted_at` / `granted_by` columns.
+
+---
+
+## Database
+
+Add to the T-02 migration set as a new migration file (do not edit the T-02 migration in place; this is a follow-on).
+
+```sql
+CREATE TABLE context.spec_shares (
+  spec_id     UUID      NOT NULL REFERENCES context.specs(id) ON DELETE CASCADE,
+  user_id    UUID      NOT NULL REFERENCES context.users(id) ON DELETE CASCADE,
+  role        TEXT      NOT NULL CHECK (role IN ('viewer', 'editor')),
+  granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  granted_by  UUID      NOT NULL REFERENCES context.users(id),
+  PRIMARY KEY (spec_id, user_id)
+);
+
+CREATE INDEX spec_shares_user_id_idx ON context.spec_shares(user_id);
+```
+
+Notes:
+- `ON DELETE CASCADE` on both FKs: when a spec or user is deleted, their share rows disappear. This is correct — a share is not an independent entity.
+- Unique `(spec_id, user_id)` via composite PK: a user has at most one share row per spec. Re-sharing updates the role; it does not create a second row.
+- `role` here is **per-share**, distinct from the global editor/viewer in `context.users`. A global `viewer` cannot be granted an `editor` share — enforce this check in the handler, not the DB.
+
+---
+
+## Endpoints
+
+All endpoints require a valid bearer token. All return JSON. Follow the existing Fastify handler conventions in `@context/backend`.
+
+### `POST /specs/:id/shares`
+
+**Who:** owner of the spec only. 403 otherwise.
+
+**Body:**
+```json
+{ "user_id": "uuid", "role": "viewer" | "editor" }
+```
+
+**Behaviour:**
+- 404 if the spec does not exist.
+- 404 if `user_id` does not exist. Do not leak existence via a different error shape.
+- 400 if `role` is `editor` but the target user's global role is `viewer`.
+- 400 if `user_id` equals the owner's id (you cannot share with yourself).
+- Upserts on `(spec_id, user_id)` — re-sharing updates the role and `granted_at`.
+- 201 on create, 200 on update. Returns the share row.
+
+### `DELETE /specs/:id/shares/:userId`
+
+**Who:** owner of the spec only.
+
+**Behaviour:**
+- 404 if the share does not exist.
+- 204 on success.
+- If the target user currently holds the edit lock on the spec, release the lock as part of this operation.
+
+### `GET /specs/:id/shares`
+
+**Who:** owner, or any user with an existing share on this spec. Non-owners see the list but cannot modify it.
+
+**Returns:** array of `{ user_id, user_display, role, granted_at, granted_by }`. `user_display` is whatever the user list endpoint already exposes — do not invent a new field shape.
+
+### Update to `GET /specs` (from T-04)
+
+The query currently returns specs where `owner_id = :caller`. Change it to:
+
+```sql
+SELECT s.*, ...
+FROM context.specs s
+LEFT JOIN context.spec_shares sh
+  ON sh.spec_id = s.id AND sh.user_id = :caller
+WHERE s.owner_id = :caller OR sh.user_id IS NOT NULL
+```
+
+Include a computed `access` field on each returned row: `"owner"`, `"editor"`, or `"viewer"`. The frontend needs this to decide whether the spec is editable without making a second call.
+
+### Permission enforcement on existing endpoints
+
+- `PATCH /specs/:id`: allow if caller is owner OR has an `editor` share. Otherwise 403.
+- `POST /specs/:id/lock`: same rule as PATCH.
+- `GET /specs/:id`: allow if caller is owner OR has any share. Otherwise 404 (not 403 — don't leak existence).
+- `GET /specs/:id/history`: same as GET.
+- Sharing operations themselves: owner only, as above.
+
+---
+
+## Frontend (extension to T-08)
+
+Add a **Share** action to the three-pane authoring view's header, visible only when the current user is the owner of the loaded spec.
+
+Clicking it opens a modal containing:
+
+1. **Current shares list.** Each row: display name, role dropdown (viewer / editor), remove button. Role changes fire `POST /specs/:id/shares` (upsert). Remove fires `DELETE`.
+2. **Add a share.** Single input for user id (uuid) — no autocomplete for v0.1, paste-only. Role selector. Submit calls `POST /specs/:id/shares`. Shows the 400 / 404 error messages inline without clearing the input.
+3. **Close button.** No save/cancel — every action is immediate.
+
+For non-owners viewing a shared spec:
+- If `access === "viewer"`: every editable field becomes read-only. Show a banner at the top: "Shared with you by {owner_display} — read-only."
+- If `access === "editor"`: editing works as normal. Banner reads: "Shared with you by {owner_display}."
+- Neither role sees the Share button. Only the owner can re-share.
+
+Update the T-07 spec list to show an "owner" column and a small chip for non-owned rows indicating the access level.
+
+---
+
+## Tests
+
+- Migration applies cleanly and rolls back cleanly.
+- `POST /specs/:id/shares` by non-owner returns 403.
+- Sharing with a global-viewer user at `editor` role returns 400.
+- Re-sharing updates role in place; no duplicate rows.
+- `GET /specs` as user B returns a spec owned by user A once B has a share row, and omits it after DELETE.
+- `PATCH /specs/:id` as an `editor` share succeeds; as a `viewer` share returns 403.
+- `GET /specs/:id` as a user with no share returns 404, not 403.
+- Deleting a user cascades share rows; deleting a spec cascades share rows.
+
+---
+
+## Done when
+
+- User A can share a spec with user B via the UI.
+- B sees the spec in their list with the correct access chip.
+- B can edit iff the share role is `editor`; otherwise the UI is read-only and the backend rejects writes.
+- Revocation by A removes the spec from B's list on next load and releases any lock B holds.
+- All existing T-04 tests still pass. T-07 and T-08 acceptance criteria still pass with the additions above.
+
+---
+
+## Non-negotiables
+
+- No plaintext tokens in logs, ever.
+- No silent role escalation: a global `viewer` never gets write access through a share.
+- The share table is not append-only. Unlike `spec_history`, historical share state has no product value for v0.1 — keep it simple.
+- `.env.example` does not change; this ticket introduces no new env vars.
+- TypeScript strict. Zod-validate every request body.
+
+---
+
+## Out of scope reminders
+
+If you find yourself wanting to add any of the following, **stop and push back** — they are out of scope and should be separate tickets:
+
+- Invite-by-email flows
+- Share links / tokenised public access
+- Organisation or team entities
+- Share expiry
+- Notification of share events
+- Audit log beyond `granted_at` / `granted_by`
+
+
 ### T-05 — Conversation state machine
 
 Pure backend logic. `nextTurn(specId)` returns `{ targetField, context }` — the highest-priority missing field whose dependencies are satisfied, or `null` if the spec is sufficiently complete. Field priority follows schema `importance` annotations (intent > domain_model > capabilities > flows > constraints > references). Dependency rule: a capability cannot be asked about before at least one entity exists. Every call persists a row in `context.conversation_turns` with the state snapshot. Pure function of spec state plus recorded turns.
