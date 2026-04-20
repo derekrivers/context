@@ -8,8 +8,8 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "build": "tsc -b",
-    "typecheck": "tsc -b --pretty false",
+    "build": "tsc -b && pnpm --filter @context/frontend build",
+    "typecheck": "tsc -b --pretty false && pnpm --filter @context/frontend typecheck",
     "test": "vitest run",
     "test:watch": "vitest"
   },
