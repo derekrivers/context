@@ -1,0 +1,121 @@
+{
+  "schema_version": "0.1",
+  "id": "66666666-6666-4666-8666-666666666666",
+  "title": "Customer relationship platform",
+  "status": "ready",
+  "created_at": "2026-03-01T09:00:00.000Z",
+  "updated_at": "2026-04-20T09:00:00.000Z",
+  "intent": {
+    "summary": "Customer relationship platform for a twenty-person consulting shop.",
+    "problem": "Existing CRMs are overbuilt and slow; the team needs a compact surface that mirrors their actual sales motion (leads sourced from partners, shortlisted, pitched, closed, and handed off to delivery) with no assumptions about territory or funnel stages borrowed from enterprise sales playbooks.",
+    "users": [
+      { "id": "partner", "persona": "Partner running the firm", "needs": "A concise view of shortlisted leads and where each one sits." },
+      { "id": "associate", "persona": "Senior associate pitching clients", "needs": "Fast capture of call notes and next-actions." }
+    ],
+    "non_goals": ["Enterprise funnel stages.", "Territory management.", "Marketing automation."]
+  },
+  "domain_model": {
+    "entities": [
+      { "id": "lead", "name": "Lead", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "source", "type": "string" },
+        { "name": "owner", "type": "uuid" }
+      ]},
+      { "id": "account", "name": "Account", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "name", "type": "string", "required": true }
+      ]},
+      { "id": "contact", "name": "Contact", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "email", "type": "string" }
+      ]},
+      { "id": "pitch", "name": "Pitch", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "stage", "type": "enum" }
+      ]},
+      { "id": "engagement", "name": "Engagement", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "starts_at", "type": "timestamptz" }
+      ]},
+      { "id": "note", "name": "Note", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "body", "type": "text" }
+      ]}
+    ],
+    "relationships": [
+      { "id": "account_contacts", "from_entity": "account", "to_entity": "contact", "kind": "one_to_many" },
+      { "id": "lead_pitches", "from_entity": "lead", "to_entity": "pitch", "kind": "one_to_many" }
+    ]
+  },
+  "capabilities": [
+    { "id": "create_lead", "name": "Create lead", "entity_ref": "lead", "verb": "create", "acceptance_criteria": [
+      { "id": "lead_req_source", "given": "a partner", "when": "they enter a lead", "then": "the source and owner are recorded" }
+    ]},
+    { "id": "qualify_lead", "name": "Qualify lead", "entity_ref": "lead", "verb": "qualify", "acceptance_criteria": [
+      { "id": "qualify_notes", "given": "an unqualified lead", "when": "an associate records qualification notes", "then": "the lead moves to shortlist" }
+    ]},
+    { "id": "shortlist_lead", "name": "Shortlist lead", "entity_ref": "lead", "verb": "shortlist", "acceptance_criteria": [
+      { "id": "shortlist_visible", "given": "a qualified lead", "when": "the partner approves shortlist", "then": "the lead is visible on the shortlist dashboard" }
+    ]},
+    { "id": "schedule_pitch", "name": "Schedule pitch", "entity_ref": "pitch", "verb": "schedule", "acceptance_criteria": [
+      { "id": "pitch_on_calendar", "given": "a shortlisted lead", "when": "an associate schedules a pitch", "then": "it appears on the team calendar" }
+    ]},
+    { "id": "record_pitch_outcome", "name": "Record pitch outcome", "entity_ref": "pitch", "verb": "update", "acceptance_criteria": [
+      { "id": "outcome_captured", "given": "a completed pitch", "when": "an associate records outcome", "then": "the pitch reflects the outcome and any next steps" }
+    ]},
+    { "id": "convert_to_engagement", "name": "Convert to engagement", "entity_ref": "engagement", "verb": "convert", "acceptance_criteria": [
+      { "id": "engagement_start", "given": "a won pitch", "when": "a partner converts it", "then": "an engagement record is created with a start date" }
+    ]},
+    { "id": "annotate_contact", "name": "Annotate contact", "entity_ref": "note", "verb": "annotate", "acceptance_criteria": [] },
+    { "id": "merge_accounts", "name": "Merge accounts", "entity_ref": "account", "verb": "merge", "acceptance_criteria": [
+      { "id": "merge_preserves_notes", "given": "two accounts flagged as duplicates", "when": "a partner merges them", "then": "all notes and contacts survive" }
+    ]},
+    { "id": "reassign_lead", "name": "Reassign lead", "entity_ref": "lead", "verb": "reassign", "acceptance_criteria": [] },
+    { "id": "import_contacts", "name": "Import contacts", "entity_ref": "contact", "verb": "import", "acceptance_criteria": [] },
+    { "id": "export_pipeline_csv", "name": "Export pipeline CSV", "entity_ref": "lead", "verb": "export", "acceptance_criteria": [] },
+    { "id": "archive_inactive", "name": "Archive inactive leads", "entity_ref": "lead", "verb": "archive", "acceptance_criteria": [
+      { "id": "archive_after_quiet", "given": "a lead with no activity for 90 days", "when": "the archive job runs", "then": "the lead is archived and removed from the primary view" }
+    ]}
+  ],
+  "flows": [
+    { "id": "lead_to_engagement", "name": "Lead to engagement", "trigger": "Partner sources a lead", "steps": [
+      { "actor": "user", "action": "creates lead" },
+      { "actor": "user", "action": "qualifies" },
+      { "actor": "user", "action": "shortlists" },
+      { "actor": "user", "action": "pitches" },
+      { "actor": "user", "action": "converts to engagement" }
+    ], "failure_modes": [
+      { "when": "source data missing", "behavior": "block shortlist" }
+    ]},
+    { "id": "merge_on_duplicate", "name": "Merge on duplicate", "trigger": "Duplicate flag raised", "steps": [
+      { "actor": "system", "action": "flags duplicate" },
+      { "actor": "user", "action": "reviews and merges" }
+    ], "failure_modes": [] },
+    { "id": "weekly_export", "name": "Weekly export", "trigger": "Scheduled weekly", "steps": [
+      { "actor": "system", "action": "assembles pipeline CSV" },
+      { "actor": "user", "action": "reviews and forwards" }
+    ], "failure_modes": [] },
+    { "id": "archive_sweep", "name": "Archive sweep", "trigger": "Nightly", "steps": [
+      { "actor": "system", "action": "identifies quiet leads" },
+      { "actor": "system", "action": "archives with audit trail" }
+    ], "failure_modes": [] }
+  ],
+  "constraints": {
+    "platform": "web",
+    "stack": { "frontend": "React", "backend": "Fastify", "database": "Postgres" },
+    "auth": "SSO",
+    "data_retention": "indefinite for active, 2 years for archived",
+    "performance": "P95 under 400ms for list endpoints",
+    "compliance": "GDPR (EU data residency only)",
+    "deploy_posture": "VPC-private"
+  },
+  "references": [
+    { "id": "team_handbook", "label": "Firm handbook", "url_or_path": "https://internal/wiki/handbook" }
+  ],
+  "provenance": { "authors": [{ "id": "derek" }], "unresolved_questions": [] },
+  "extensions": {
+    "reddwarf:project_spec": {
+      "sourceRepo": "derekrivers/firm-crm"
+    }
+  }
+}

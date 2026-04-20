@@ -65,6 +65,7 @@ function serializeSpec(row: Spec): Record<string, unknown> {
     title: row.title,
     status: row.status,
     schema_version: row.schemaVersion,
+    version: row.version,
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
     locked_by: row.lockedBy,
@@ -85,6 +86,7 @@ function serializeSpecSummary(row: Spec, access: Access): Record<string, unknown
     title: row.title,
     status: row.status,
     owner_id: row.ownerId,
+    version: row.version,
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
     access,
@@ -315,10 +317,21 @@ export const specRoutes: FastifyPluginAsync<SpecRoutesOptions> = async (
     nextSpec = { ...nextSpec, title: nextTitle, status: nextStatus }
 
     const diff = computeDiff(row.specJson, nextSpec)
+    const META_ONLY = new Set(['updated_at'])
+    const substantiveChange = diff.changes.some(
+      (c) => c.path !== '$' && !META_ONLY.has(c.path),
+    )
+    const nextVersion = substantiveChange ? row.version + 1 : row.version
 
     const updated = await db.client
       .update(specs)
-      .set({ title: nextTitle, status: nextStatus, specJson: nextSpec, updatedAt: now })
+      .set({
+        title: nextTitle,
+        status: nextStatus,
+        specJson: nextSpec,
+        updatedAt: now,
+        version: nextVersion,
+      })
       .where(eq(specs.id, row.id))
       .returning()
 

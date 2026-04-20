@@ -137,6 +137,7 @@ export async function applyFieldUpdates(
       status: nextSpecValidated.status,
       specJson: nextSpecValidated,
       updatedAt: now,
+      version: row.version + 1,
     })
     .where(eq(specs.id, specId))
     .returning()

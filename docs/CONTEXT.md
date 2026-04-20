@@ -2236,18 +2236,666 @@ Flag these in the PR description:
 - Whether the next-action card's priority order needs tweaking based on real-world use — the five-tier order specified here is a starting point.
 - Whether `retry_request` is a new phase in `conversation_turns` or reuses an existing phase with different semantics. New phase is cleaner; extending an existing phase is less migration work. Pick what fits T-05's actual enum shape.
 - Whether unresolved questions should also appear in the activity feed or be deliberately separate. I'd suggest separate — the activity feed is "what happened," unresolved is "what's stuck." Different mental models.
+# T-09 — RedDwarf Adapter Package
 
-### T-09 — RedDwarf adapter package
+You are implementing ticket **T-09** in the Context MVP build plan. This ticket creates the translation layer between Context's canonical spec and RedDwarf's ProjectSpec. It is a pure function with no network calls, no side effects, no persistence — just data in, data out, plus translation notes flagging anything dropped.
 
-Create `@context/reddwarf-adapter`. Exposes `toProjectSpec(canonicalSpec): { projectSpec, translationNotes }` as a pure function. Reads `extensions['reddwarf:project_spec']` if present; infers defaults otherwise. Canonical capabilities translate to RedDwarf TicketSpecs in dependency order. Anything dropped in translation appears in `translationNotes` with path and reason. Adapter version is pinned to a specific schema major version; mismatches throw at load.
+This ticket depends on T-01 (canonical schema). It does **not** depend on T-10 — the adapter can ship before RedDwarf's injection endpoint exists. The adapter's output is validated against RedDwarf's ProjectSpec schema (see "Target schema" below), which must exist in RedDwarf today.
 
-**Done when:** a canonical spec round-trips to a valid RedDwarf ProjectSpec, and the translation notes make silent information loss impossible.
+---
 
-### T-10 — RedDwarf injection endpoint
+## Which repo this ticket lives in
 
-Add `POST /projects/inject` to RedDwarf's operator API. Accepts `{ projectSpec, spec_provenance: { context_spec_id, context_version, translation_notes } }`. Validates against RedDwarf's existing ProjectSpec Zod schema. Creates the project in `pending_approval` — same state a Project Mode planning run would produce, so the existing approval flow works unchanged. Provenance persists on the ProjectSpec and is visible in the RedDwarf dashboard. Translation notes archive to evidence. Protected by `REDDWARF_OPERATOR_TOKEN`. Idempotent on `(context_spec_id, context_version)` — re-posting returns the existing project rather than creating a duplicate.
+**Context repo** (`github.com/derekrivers/context`). New workspace package: `packages/reddwarf-adapter/`, published internally as `@context/reddwarf-adapter`.
 
-**Done when:** a full end-to-end session — Context conversation → export → injection → RedDwarf approval → executed PR — closes cleanly.
+T-09 does **not** touch the RedDwarf repo. The adapter produces a payload that matches RedDwarf's public contract; the actual injection happens in T-10, which is a RedDwarf-side ticket.
+
+---
+
+## Target schema — read RedDwarf before writing code
+
+Before writing any adapter code, read RedDwarf's actual ProjectSpec schema. This ticket translates into that schema, not one we invent.
+
+The agent must:
+
+1. Clone or browse `github.com/derekrivers/RedDwarf` locally.
+2. Locate the ProjectSpec Zod schema. Likely candidates (in priority order): `packages/contracts/`, `schemas/`, or a package exporting project-shaped types.
+3. Read the schema end to end. Note: required fields, optional fields, nested structures (especially any TicketSpec / TaskManifest nesting inside a project), enums, and validation constraints.
+4. Document in the PR description the exact file path and version of the schema being targeted.
+
+If the ProjectSpec schema does not exist in RedDwarf yet, stop and flag that before proceeding. This ticket cannot be built correctly against a schema that isn't real. Ask which existing RedDwarf artifact (TaskManifest, planning spec, whatever) is the closest fit and reshape T-09 accordingly. Do not invent a schema.
+
+### Target consumption strategy
+
+Pick one of these approaches for how the adapter knows the target schema; flag the choice in the PR description:
+
+- **Vendored types.** Copy the relevant Zod schema (or hand-derived TypeScript types) into `packages/reddwarf-adapter/src/reddwarf-types.ts` with a comment pointing at the source file in RedDwarf and a version string. Pros: no dependency on RedDwarf's internals. Cons: can drift.
+- **Published dep.** If RedDwarf publishes `@reddwarf/contracts` (or similar) to a registry you can consume, depend on it. Pros: stays in sync. Cons: Context now has a hard dependency on RedDwarf's release cadence.
+- **Git submodule or workspace link.** Don't do this for v0.1. Too fragile for a solo-dev MVP.
+
+Vendored is the default unless RedDwarf publishes a package you can consume cleanly.
+
+---
+
+## Scope
+
+### In
+
+- `packages/reddwarf-adapter/` workspace package.
+- Pure function `toProjectSpec(canonicalSpec: CanonicalSpec): { projectSpec: ProjectSpec, translationNotes: TranslationNote[] }`.
+- Schema version pinning: the adapter declares a target ProjectSpec schema major version. Mismatch at load time throws a loud error.
+- Reading of `extensions['reddwarf:project_spec']` for caller-supplied overrides.
+- Inference defaults when extensions are absent.
+- Translation of canonical capabilities → RedDwarf's task / ticket representation in dependency order.
+- Translation notes covering every dropped or inferred field.
+- Exhaustive unit tests against fixture canonical specs.
+
+### Out
+
+- Any network call. The adapter is a pure function.
+- Any filesystem or database access.
+- Persistence of the output. The caller (T-08's "Send to RedDwarf" flow) handles transport.
+- Reverse translation (ProjectSpec → canonical). One-way only in v0.1.
+- Multi-project output. One canonical spec → one ProjectSpec.
+- Language translation, summarisation, or LLM calls. The adapter is deterministic.
+
+### Permanently out of scope
+
+- Bidirectional sync.
+- Partial / incremental translation.
+- Diffing two canonical specs and producing a ProjectSpec patch.
+- Non-RedDwarf target adapters (Jira, Linear, Asana). Each would be its own package.
+
+---
+
+## Function contract
+
+```ts
+export type TranslationNote = {
+  kind: "dropped" | "inferred" | "downgraded" | "grouped" | "coerced";
+  canonicalPath: string;           // path in the source canonical spec
+  projectSpecPath: string | null;  // path in the output ProjectSpec, if applicable
+  reason: string;                  // human-readable
+  severity: "info" | "warning";
+};
+
+export type AdapterResult = {
+  projectSpec: ProjectSpec;        // RedDwarf's published type, imported or vendored
+  translationNotes: TranslationNote[];
+  contextSpecId: string;           // from canonicalSpec.id, passthrough for provenance
+  contextVersion: number;          // from canonicalSpec.version (a spec mutation counter from T-04)
+  adapterVersion: string;          // e.g. "0.1.0", from package.json
+  targetSchemaVersion: string;     // RedDwarf ProjectSpec schema major version the output validates against
+};
+
+export function toProjectSpec(
+  canonicalSpec: CanonicalSpec,
+): AdapterResult;
+```
+
+The function is synchronous and pure. No async, no promises, no mutation of the input.
+
+### Invariants
+
+- Every translation note has a non-empty `reason` written for a human reviewer.
+- The output `projectSpec` validates against the target Zod schema. The adapter calls the target's `.parse()` before returning and throws if validation fails (that's a bug in the adapter, not the input).
+- If a required ProjectSpec field has no canonical source and no inferred default, the adapter throws a `TranslationError` with the path and a message explaining what's missing. The caller surfaces this in the UI as "Your spec is missing fields RedDwarf requires."
+- `translationNotes` is ordered deterministically: by `severity` descending (warning before info), then by `canonicalPath` ascending.
+
+---
+
+## Translation rules
+
+Once you've read RedDwarf's real ProjectSpec schema, the mappings below need reconciling with what's actually there. Treat these as directional, not authoritative. Flag every deviation in the PR description.
+
+### Top-level mapping (expected)
+
+| Canonical source | ProjectSpec target | Notes |
+|---|---|---|
+| `intent.summary` | project name / title | Truncate if RedDwarf has a length limit; note the truncation. |
+| `intent.problem` | project description | Include verbatim where length allows. |
+| `intent.users` | audience / stakeholder metadata if ProjectSpec has it, else dropped with note | |
+| `intent.non_goals` | explicit non-goals field if present, else dropped with note | |
+| `domain_model.entities` | metadata / context bundle if ProjectSpec supports freeform context, else dropped with note | RedDwarf's Architect regenerates this from the planning pass; we don't force it. |
+| `capabilities[]` | tasks / tickets (one per capability) | See "Capabilities → Tasks" below. |
+| `flows[]` | attached to the tasks that implement them, or included as flow metadata on the project | Depends on ProjectSpec shape. |
+| `constraints.*` | project-level constraints or per-task constraints | Depends on ProjectSpec shape. |
+| `references[]` | project references / links if supported, else dropped with note | |
+| `provenance.*` | discarded | Provenance is Context-internal. |
+| `extensions['reddwarf:project_spec']` | merged over the inferred output | See "Extension overrides" below. |
+
+### Capabilities → Tasks
+
+Each capability becomes one task. For each capability:
+
+- **Task title** = capability verb + capability name (e.g. "create user", "list invoices").
+- **Task description** = capability description plus a formatted block of acceptance criteria (given/when/then).
+- **Task risk class** = inferred from capability metadata if available, else defaults to `medium`. Log an `inferred` translation note per task so the reviewer can sanity-check before approval.
+- **Task capability flags** (`can_write_code`, `can_run_tests`, `can_open_pr`, etc.) = pulled from `extensions['reddwarf:project_spec'].default_task_capabilities` if present, else a conservative default of `can_plan, can_write_code, can_run_tests, can_open_pr`. Log a `inferred` note when defaults are used.
+- **Task dependencies** = derived from cross-capability references in the canonical spec. If capability B's `given` clause references entities created by capability A, A becomes a dependency of B. If the dependency graph is ambiguous, produce the tasks in canonical order with no dependencies and emit a `warning` note.
+
+Task ordering in the output array is topological: dependencies come before dependents. If RedDwarf's ProjectSpec represents dependencies via explicit fields, use those. If it represents them implicitly via order, rely on the array order.
+
+### Flows
+
+Each flow is a sequence of steps that touches one or more capabilities. Map:
+
+- **Flow name** → attached to each dependent task as "implements flow: X" in the task description.
+- **Flow steps** → rendered as a numbered list in the task description of the first implementing task, with a note linking to subsequent tasks.
+- **Failure modes** → appended to each implementing task's description under a "Failure modes to handle" heading.
+
+If ProjectSpec has a first-class flow field, use it instead. This prompt is written assuming it doesn't — adjust when you've read the real schema.
+
+### Constraints
+
+- **Platform, stack** → project-level constraint fields if present, else concatenated into the project description under a "Technical constraints" heading.
+- **Auth, data_retention, compliance, performance** → same treatment.
+- **Deploy posture** → project-level if first-class, else description.
+
+### Unknown fields
+
+Any canonical field with value `{ unknown: true, reason }` is dropped with a `dropped` translation note. If the field maps to a required ProjectSpec field, this triggers a `TranslationError` — the caller cannot ship an incomplete ProjectSpec to RedDwarf.
+
+---
+
+## Extension overrides
+
+The canonical schema reserves `extensions['reddwarf:project_spec']` for caller-supplied overrides. This is the escape valve for users who want precise control.
+
+Behaviour:
+
+- Extension values **override** inferred values, never the reverse.
+- Every override writes an `info` translation note: `"Overridden by extensions['reddwarf:project_spec'].<path>"`.
+- Extension paths that don't correspond to any ProjectSpec field trigger a `warning` note and are silently dropped. Don't fail the translation — a caller pinning an extension that no longer maps after a schema upgrade should see a warning, not a crash.
+
+The extension shape itself is a partial ProjectSpec. No special schema — users write whatever ProjectSpec fields they want to pin.
+
+---
+
+## Schema version pinning
+
+The adapter is pinned to a specific major version of the RedDwarf ProjectSpec schema.
+
+At module load time:
+
+```ts
+const ADAPTER_TARGET_MAJOR = 1;  // adjust per your read of RedDwarf's schema
+
+if (ProjectSpecSchema.version.major !== ADAPTER_TARGET_MAJOR) {
+  throw new Error(
+    `@context/reddwarf-adapter is pinned to ProjectSpec major v${ADAPTER_TARGET_MAJOR}, ` +
+    `but RedDwarf exports v${ProjectSpecSchema.version.major}. ` +
+    `Upgrade the adapter before continuing.`
+  );
+}
+```
+
+If RedDwarf's schema doesn't expose a version number at runtime, agree a convention with RedDwarf (a `SCHEMA_VERSION` const exported from the contracts package) and add it there as part of this ticket. Note it in the PR description.
+
+---
+
+## Error model
+
+```ts
+export class TranslationError extends Error {
+  constructor(
+    public missingPaths: string[],
+    public partialNotes: TranslationNote[],
+  ) {
+    super(`Cannot translate: missing required fields: ${missingPaths.join(", ")}`);
+  }
+}
+
+export class SchemaVersionError extends Error {
+  constructor(public expected: number, public actual: number) {
+    super(`Adapter expects ProjectSpec v${expected}, got v${actual}`);
+  }
+}
+```
+
+Any other unexpected input (malformed canonical spec, for instance) should also throw a typed error — don't let ad-hoc `Error` instances leak out.
+
+---
+
+## Package layout
+
+```
+packages/reddwarf-adapter/
+├── package.json
+├── tsconfig.json                     # extends ../../tsconfig.base.json
+├── src/
+│   ├── index.ts                      # exports toProjectSpec, types, errors
+│   ├── adapter.ts                    # the pure function
+│   ├── rules/
+│   │   ├── intent.ts                 # intent → project top-level
+│   │   ├── capabilities.ts           # capabilities → tasks + dependency topo-sort
+│   │   ├── flows.ts                  # flow attachment logic
+│   │   ├── constraints.ts            # constraints → project fields or description
+│   │   └── references.ts
+│   ├── reddwarf-types.ts             # vendored ProjectSpec type (if vendored approach)
+│   ├── errors.ts                     # TranslationError, SchemaVersionError
+│   └── version.ts                    # ADAPTER_VERSION, ADAPTER_TARGET_MAJOR
+├── fixtures/                         # canonical-spec fixtures for tests
+│   ├── minimal-crud.json
+│   ├── complex-with-flows.json
+│   ├── with-unknowns.json
+│   ├── with-extensions-override.json
+│   └── missing-required-field.json
+└── src/__tests__/
+    ├── adapter.test.ts               # end-to-end: fixture → ProjectSpec → validates
+    ├── intent.test.ts
+    ├── capabilities.test.ts
+    ├── flows.test.ts
+    ├── constraints.test.ts
+    ├── extensions.test.ts
+    ├── unknowns.test.ts
+    └── errors.test.ts
+```
+
+No `index.ts` barrel files inside `rules/`. Each rule module exports the specific functions it owns.
+
+---
+
+## Tests
+
+The adapter lives or dies by tests. This is the part of the system most exposed to the real world; bugs here produce confusing approval failures downstream in RedDwarf.
+
+### Required fixtures
+
+- `minimal-crud.json` — two entities, three capabilities, one flow, no unknowns, no extensions. Round-trips cleanly.
+- `complex-with-flows.json` — five entities, eight capabilities, three flows with failure modes, realistic constraints.
+- `with-unknowns.json` — some fields explicitly marked `{ unknown: true, reason }`. Non-required unknowns are dropped with notes; a required unknown triggers `TranslationError`.
+- `with-extensions-override.json` — a realistic `extensions['reddwarf:project_spec']` that pins title, risk classes, and capability flags on specific tasks.
+- `missing-required-field.json` — `intent.summary` is absent. Must throw `TranslationError` with path `intent.summary`.
+
+### Required assertions
+
+For every fixture:
+- The returned `projectSpec` validates against RedDwarf's actual schema (import and `.parse()`).
+- `translationNotes` contains exactly the expected entries — not a superset.
+- Task dependency order is topological when dependencies exist.
+- Deterministic: running the adapter on the same input twice returns identical output (including note ordering).
+
+Snapshot tests are acceptable for the full output. They're fast feedback when refactoring, and the fixtures aren't so long that diffs become unreadable.
+
+### Fuzz / property test (optional but recommended)
+
+A lightweight property test: given a randomly generated canonical spec that passes T-01's Zod validation, `toProjectSpec` either returns a valid ProjectSpec or throws a typed error. It never throws an untyped error, never returns invalid output. Use `fast-check` if you want this; skip if it bloats the ticket.
+
+---
+
+## Done when
+
+- `pnpm --filter @context/reddwarf-adapter build` produces clean output with no type errors.
+- `pnpm --filter @context/reddwarf-adapter test` passes all fixture tests.
+- A canonical spec produced by a real T-08 conversation (the "genuine 45-minute spec" from T-08's done-when) translates cleanly through the adapter and the output validates against RedDwarf's schema.
+- Running the adapter twice on the same canonical spec produces byte-identical output.
+- Dropping or changing any field in RedDwarf's ProjectSpec schema produces a clean build error in the adapter, not a silent miscompile.
+- PR description documents: which RedDwarf file/version is being targeted, the consumption strategy (vendored/dep), every deviation from this ticket's directional mapping table, and any clarifications needed from the RedDwarf team.
+
+---
+
+## Non-negotiables
+
+- Pure function. No network, no fs, no db, no LLM. If you think you need any of those, stop and flag.
+- Output validates against RedDwarf's real schema. No mocks, no hand-written shape pretending to be the target.
+- Translation notes make silent information loss impossible. Every dropped field, every inferred value, every downgrade — one note each.
+- Schema version mismatch is a hard error at load time, not a runtime surprise.
+- `extensions['reddwarf:project_spec']` overrides inferred values, never the reverse.
+- TypeScript strict.
+- No RedDwarf env vars (the adapter has no runtime config).
+- No new top-level dependencies beyond Zod (already in Context) and optionally `fast-check` for property tests.
+
+---
+
+## Out of scope
+
+Push back if asked to add any of these:
+
+- A reverse adapter (ProjectSpec → canonical).
+- Multi-target adapters (Jira, Linear).
+- LLM-assisted translation.
+- HTTP calls, file writes, DB writes.
+- A CLI for the adapter. If T-10 wants one, that's T-10's problem.
+- Caching or memoisation. The adapter is fast enough that it doesn't need it.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- Vendored types vs published dep — pick based on what RedDwarf actually ships.
+- Whether canonical capabilities produce tasks eagerly (every capability → task) or lazily (only capabilities marked "implement in first pass" → task). Eager is the default; note if RedDwarf's planning agent would prefer something different.
+- How flow failure modes get attached to tasks — inline in description, or a separate ProjectSpec field if one exists.
+- Whether `intent.users` maps to a real ProjectSpec field or drops with a note. Depends on schema.
+- The exact string formatting for task descriptions (Markdown? Plain text? Freeform?). RedDwarf's Architect will re-read these, so clarity trumps prettiness.
+
+
+# T-10 — RedDwarf Injection Endpoint
+
+You are implementing ticket **T-10** in the Context MVP build plan. This is the final ticket. It closes the loop: Context exports a ProjectSpec via the T-09 adapter, posts it to RedDwarf, and RedDwarf creates the project in its existing approval queue — the same state a Project Mode planning run would produce, so the existing human-approval flow works unchanged.
+
+This ticket depends on T-01 through T-09 of Context, plus whatever RedDwarf infrastructure already exists for Projects and approval (documented in RedDwarf's architecture doc and contracts).
+
+---
+
+## Which repo this ticket lives in
+
+**RedDwarf repo** (`github.com/derekrivers/RedDwarf`), not Context. All files created or modified by this ticket are inside the RedDwarf monorepo.
+
+This is a crucial distinction from every other ticket in the Context MVP plan. The PR goes against `derekrivers/RedDwarf`, not `derekrivers/context`. The agent must:
+
+- Clone or work inside the RedDwarf repo.
+- Follow RedDwarf's conventions (AGENTS.md, CLAUDE.md, `REDDWARF_*` env vars, existing package structure).
+- Open the PR against RedDwarf's default branch.
+- Not import anything from the Context repo.
+
+T-10 is the one place in the entire MVP plan where a cross-repo touch happens. Context's T-08 "Send to RedDwarf" flow calls this endpoint over HTTP; it does not link to RedDwarf code at build time.
+
+---
+
+## Context — read RedDwarf first
+
+Before writing any code, the agent reads:
+
+- `AGENTS.md` — autonomous execution conventions. Follow them.
+- `CLAUDE.md` — if present.
+- `FEATURE_BOARD.md` — context on the priority of this work. Note especially feature #96 ("Direct task injection endpoint — `POST /tasks/inject`"). T-10 is conceptually related but targets the Project entity rather than raw Tasks. If feature #96 has landed, reuse its patterns. If not, T-10 establishes the pattern and feature #96 may converge on it later.
+- `openclaw_ai_dev_team_v_2_architecture.md` — the canonical architecture doc.
+- `docs/agent/Documentation.md` and `docs/agent/TROUBLESHOOTING.md` — persistent repo memory.
+- The operator API routes (likely in a `packages/control-plane` or equivalent package). Note auth middleware (`REDDWARF_OPERATOR_TOKEN`), error shapes, and logging conventions.
+- The ProjectSpec Zod schema (same schema T-09 targeted; whoever implemented T-09 documented the path in their PR).
+- The existing approval queue mechanics: how `pending_approval` state is reached for a Project Mode planning run, where approval records persist, how the operator UI lists pending approvals, and how approvals route back into the pipeline post-decision.
+- The evidence plane persistence layer, because translation notes will archive there.
+
+If any of these aren't reachable or have changed materially since this ticket was drafted, stop and flag before proceeding.
+
+---
+
+## Scope
+
+### In
+
+- New operator API route: `POST /projects/inject`.
+- Request validation against the existing ProjectSpec Zod schema.
+- Persistence of the injected project in the same database state as a Project Mode planning run reaches when it produces a pending-approval project.
+- Persistence of provenance metadata (`context_spec_id`, `context_version`, `adapter_version`, `target_schema_version`).
+- Archival of translation notes to the evidence plane.
+- Idempotency on `(context_spec_id, context_version)` — re-posting returns the existing project rather than creating a duplicate.
+- Operator UI surfacing of provenance on the project detail view (minor addition).
+- Integration tests covering: valid injection, invalid ProjectSpec (422), idempotent re-submit, auth rejection, schema version mismatch.
+- Updates to `.env.example`, operator API route documentation, and the FEATURE_BOARD entry if one exists for this work.
+
+### Out
+
+- Any change to the approval logic itself. The endpoint must produce a project in the same state the existing planning path produces; after that, the existing flow is untouched.
+- Any Context-side code. Context's "Send to RedDwarf" button is wired in T-08a behind a feature flag; when this ticket lands, the flag can be flipped — but flipping it is not part of T-10.
+- Batch injection (multiple projects in one POST). One project per request.
+- An async queue for injection. The endpoint is synchronous: validate, persist, return project ID.
+- Notifications (Discord, Slack). Existing approval queue notifications should fire naturally once the project is in the queue — verify they do, but don't add new notification paths.
+- Rate limiting beyond whatever's already in place on operator routes.
+- Authentication other than the existing `REDDWARF_OPERATOR_TOKEN` bearer auth.
+
+### Permanently out of scope
+
+- Bidirectional sync (RedDwarf approval decisions flowing back to Context).
+- Streaming updates (SSE, webhooks).
+- Multi-tenant support. This is single-operator.
+- Re-execution on adapter version upgrade (existing pending-approval projects stay as they were).
+
+---
+
+## Endpoint contract
+
+### Request
+
+`POST /projects/inject`
+
+Headers:
+- `Authorization: Bearer <REDDWARF_OPERATOR_TOKEN>` (existing operator auth middleware).
+- `Content-Type: application/json`.
+
+Body:
+
+```ts
+type InjectionRequest = {
+  projectSpec: ProjectSpec;        // RedDwarf's existing Zod schema
+  provenance: {
+    context_spec_id: string;       // UUID from Context
+    context_version: number;       // Context's per-spec mutation counter
+    adapter_version: string;       // semver, e.g. "0.1.0"
+    target_schema_version: string; // RedDwarf ProjectSpec schema version the adapter targeted
+    translation_notes: TranslationNote[];  // the full adapter output notes
+  };
+};
+
+type TranslationNote = {
+  kind: "dropped" | "inferred" | "downgraded" | "grouped" | "coerced";
+  canonicalPath: string;
+  projectSpecPath: string | null;
+  reason: string;
+  severity: "info" | "warning";
+};
+```
+
+The `TranslationNote` shape matches T-09's output exactly. Duplicate the type here in RedDwarf — do not import from Context. This is the contract boundary between the two systems.
+
+### Responses
+
+- **201 Created** on new project injection. Body:
+  ```ts
+  { project_id: string, state: "pending_approval", provenance_id: string }
+  ```
+- **200 OK** on idempotent re-submit (matching `context_spec_id` + `context_version` already exists). Body:
+  ```ts
+  { project_id: string, state: "<current state>", provenance_id: string, deduplicated: true }
+  ```
+- **400 Bad Request** — malformed JSON, missing fields.
+- **401 Unauthorized** — missing or invalid bearer token.
+- **403 Forbidden** — token valid but scoped such that injection isn't permitted (follow existing operator-token conventions).
+- **409 Conflict** — idempotency key collision where the existing project is in an incompatible state (e.g. approved but the resubmit would overwrite). Body includes enough info to disambiguate. Prefer this over silent overwrite.
+- **422 Unprocessable Entity** — ProjectSpec failed Zod validation. Body includes the Zod error paths and messages verbatim.
+- **5xx** — unexpected. Standard RedDwarf error shape.
+
+Error body shape follows whatever RedDwarf's existing operator routes return. Don't invent a new error format.
+
+---
+
+## Persistence
+
+### Project record
+
+Persist the project in the same tables and the same state that a Project Mode planning run produces when it reaches pending-approval. Read the existing planning code and reuse its persistence helpers. Do not duplicate logic — if the existing pipeline exposes a function like `recordProjectPendingApproval(projectSpec, metadata)`, call that. If it doesn't, refactor the existing code to extract one as part of this ticket.
+
+The reviewer of this PR should not be able to find a single line of persistence logic in the injection route that isn't either (a) a call to the existing planning persistence layer, or (b) provenance-specific persistence introduced by this ticket.
+
+### Provenance record
+
+New persistence — the cleanest approach is a sibling table or column set to the existing project tables.
+
+Suggested table: `context.project_spec_provenance` (namespace matches other RedDwarf tables). Columns:
+
+```sql
+CREATE TABLE context.project_spec_provenance (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id            UUID NOT NULL REFERENCES <existing projects table>(id) ON DELETE CASCADE,
+  context_spec_id       TEXT NOT NULL,
+  context_version       INTEGER NOT NULL,
+  adapter_version       TEXT NOT NULL,
+  target_schema_version TEXT NOT NULL,
+  injected_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  injected_by           TEXT,                    -- operator identifier if available
+  UNIQUE (context_spec_id, context_version)
+);
+
+CREATE INDEX project_spec_provenance_project_id_idx
+  ON context.project_spec_provenance(project_id);
+```
+
+The `UNIQUE (context_spec_id, context_version)` constraint is the **idempotency key**. See "Idempotency" below.
+
+Adjust the schema name and references based on what exists in RedDwarf's migration history. Follow whatever the control-plane package already uses.
+
+### Translation notes archival
+
+Translation notes go to the **evidence plane**, not to the provenance table. Each injection produces one evidence record containing the full notes array plus a pointer back to the project and provenance. Reuse whatever evidence-plane API RedDwarf already exposes for archiving structured artifacts.
+
+If the evidence plane stores artifacts by key, use the key `project-inject-{project_id}-translation-notes`. If it stores by row, match whatever shape other evidence rows use.
+
+Translation notes are read-only after archival. No editing, no re-running.
+
+---
+
+## Idempotency
+
+The `UNIQUE (context_spec_id, context_version)` constraint enforces that re-posting a spec with the same version never creates a second project.
+
+On constraint violation, the handler:
+
+1. Fetches the existing provenance record and the project it references.
+2. Checks the project's current state:
+   - If in `pending_approval` — returns 200 with `deduplicated: true`. User can re-fetch status without drama.
+   - If in any later state (approved, in_development, completed, failed) — returns 200 with `deduplicated: true` and the current state. Does not revert, does not error.
+   - If the project was deleted or cancelled such that a fresh injection would make sense — returns 409 with a message like "Previously injected project was cancelled. Bump `context_version` and retry."
+
+The decision to bump `context_version` lives on the Context side. T-10 does not mutate Context's state.
+
+---
+
+## Operator UI surfacing
+
+Minor addition — the project detail view should surface:
+
+- A badge or tag indicating "Injected from Context" (versus "Planned from issue").
+- The `context_spec_id` (clickable if you have a Context URL — make it configurable via `CONTEXT_BASE_URL` env var, defaulting to unset, which renders the id as plain text).
+- The `adapter_version` and `target_schema_version` in a details section.
+- A link to the archived translation notes evidence record.
+
+If RedDwarf doesn't have a web UI and this is an API-only operator surface today, skip this section and document it as a follow-up ticket.
+
+---
+
+## Feature flag
+
+If RedDwarf has a feature-flag system, gate this endpoint behind a flag (default off) for the first few deploys. If not, skip — the endpoint is protected by `REDDWARF_OPERATOR_TOKEN` and can simply exist.
+
+Env var if flagged:
+
+```
+REDDWARF_PROJECTS_INJECT_ENABLED=false
+```
+
+When `false`, the route returns 404 (not 403 — we're pretending it doesn't exist).
+
+---
+
+## Tests
+
+### Unit
+
+- Request body validation: every required field, every type, the idempotency shape.
+- Provenance table upsert logic under race conditions (two simultaneous requests with the same key — one wins, one sees the dedup response).
+- Error mapping: each failure mode maps to the correct status code and error body shape.
+
+### Integration
+
+- Full happy path: valid ProjectSpec, valid provenance → 201, project queryable via existing project read endpoints, provenance record exists, translation notes evidence exists.
+- Invalid ProjectSpec → 422 with Zod paths.
+- Missing auth → 401.
+- Wrong token → 401.
+- Idempotent resubmit (same spec id + version) → 200 with `deduplicated: true` and identical `project_id`.
+- Idempotent resubmit after approval → 200 with `deduplicated: true` and current state.
+- Idempotent resubmit after cancellation → 409.
+- Schema-version mismatch in provenance (`target_schema_version` doesn't match current RedDwarf schema) → log a warning, proceed. Archival captures the mismatch for audit. Do not reject — the adapter pinning is an informational signal, not a policy gate.
+
+### End-to-end
+
+The "Done when" criterion below implies a full round-trip:
+
+1. Start Context, run a conversation to a reasonable threshold, produce a canonical spec.
+2. Trigger T-08's "Send to RedDwarf" action (feature flag flipped on).
+3. Context calls `POST /projects/inject`.
+4. RedDwarf returns 201 with the new project id.
+5. The project appears in RedDwarf's pending-approval queue.
+6. An operator approves it through the existing flow.
+7. The existing pipeline dispatches it to the Architect, Developer, Validation, Review, SCM phases.
+8. A PR is opened.
+
+All of that works unchanged from how a Project Mode planning run would reach the same state. If any gate in RedDwarf treats an injected project differently from a planned project, that's a bug — fix it or document the divergence clearly.
+
+---
+
+## Config
+
+Add to `.env.example` in canonical order with comments:
+
+```
+# -- Context integration ------------------------------------------------------
+# Optional. Set to false to disable the POST /projects/inject operator route.
+REDDWARF_PROJECTS_INJECT_ENABLED=true
+# Optional. If set, the operator UI links context_spec_id back to Context.
+# Example: https://context.example.com
+CONTEXT_BASE_URL=
+```
+
+No new secrets. The existing `REDDWARF_OPERATOR_TOKEN` covers auth.
+
+---
+
+## Done when
+
+- `POST /projects/inject` exists on the operator API, documented and tested.
+- A valid ProjectSpec produced by T-09's adapter (from a real Context conversation) injects cleanly and appears in RedDwarf's pending-approval queue.
+- The existing approval UI can approve the project; the existing pipeline runs development, validation, review, and SCM phases; a PR is opened.
+- Re-posting the same `(context_spec_id, context_version)` returns 200 with `deduplicated: true`, not a second project.
+- Invalid ProjectSpec returns 422 with readable Zod paths.
+- Translation notes are archived to evidence and discoverable from the project.
+- Provenance is visible in the operator UI (if applicable).
+- `pnpm test` (or RedDwarf's equivalent verify scripts) passes with the new tests.
+- PR description documents: every file touched, every migration added, the exact operator flow for approving an injected project, and any divergences between injected and planned projects.
+
+---
+
+## Non-negotiables
+
+- RedDwarf repo only. No Context imports, no Context env vars.
+- Injected projects reach `pending_approval` via the same persistence path as a planning run. No parallel pipeline.
+- Idempotent on `(context_spec_id, context_version)`. Hard DB constraint, not application-level dedup.
+- Translation notes go to the evidence plane, not the provenance table.
+- No change to approval logic. The approval flow is already correct for planning-run projects; injected projects inherit it.
+- `REDDWARF_OPERATOR_TOKEN` auth on every request. No bypass.
+- Follow RedDwarf's existing conventions (logging, error shapes, pg pool, migration scripts). Don't introduce new patterns.
+- TypeScript strict. Zod-validate the request body.
+- `.env.example` updated in canonical order with comments.
+
+---
+
+## Out of scope
+
+Push back if asked to add any of these:
+
+- Bidirectional sync.
+- Webhooks or SSE for approval decisions.
+- Batch injection.
+- An async injection queue.
+- Injection of partially-complete specs (below Context's completeness threshold). Context's UI prevents this; don't duplicate the check here.
+- A `PUT /projects/inject` or `PATCH /projects/inject/:id` for updating an injected project. If the user wants to revise, they bump `context_version` in Context and re-inject — that's what the version number is for.
+- Notifications beyond what RedDwarf's existing approval queue already fires.
+- Analytics on injection rates, times, or outcomes. Observability follows RedDwarf's existing metrics model.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- Exact table name and schema for the provenance table. Follow RedDwarf's migration conventions.
+- Whether idempotent resubmits return 200 or 202 (both are defensible). I'd pick 200 for clarity.
+- Whether the operator UI surfacing is part of this ticket or a follow-up. If RedDwarf doesn't have a web UI yet, definitely a follow-up.
+- Whether the feature flag is used or the endpoint ships on by default. If RedDwarf has a flag system, use it for the first few deploys.
+- How RedDwarf's existing pipeline distinguishes (if at all) between injected and planned projects. Ideally they're indistinguishable post-approval; if they're not, document why.
+
 
 ---
 

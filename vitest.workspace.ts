@@ -5,7 +5,7 @@ export default defineWorkspace([
     test: {
       name: 'node',
       environment: 'node',
-      include: ['packages/{spec-schema,backend}/tests/**/*.test.ts'],
+      include: ['packages/{spec-schema,backend,reddwarf-adapter}/tests/**/*.test.ts'],
       fileParallelism: false,
     },
   },

@@ -1,0 +1,54 @@
+{
+  "schema_version": "0.1",
+  "id": "33333333-3333-4333-8333-333333333333",
+  "title": "Spec with unknowns",
+  "status": "draft",
+  "created_at": "2026-04-01T12:00:00.000Z",
+  "updated_at": "2026-04-20T09:00:00.000Z",
+  "intent": {
+    "summary": "Exploratory feature-flag service.",
+    "problem": "Teams need a shared way to gate features across environments without redeploying."
+  },
+  "domain_model": {
+    "entities": [
+      { "id": "flag", "name": "Flag", "fields": [{ "name": "id", "type": "uuid", "required": true }] }
+    ],
+    "relationships": []
+  },
+  "capabilities": [
+    {
+      "id": "toggle_flag",
+      "name": "Toggle flag",
+      "entity_ref": "flag",
+      "verb": "toggle",
+      "acceptance_criteria": []
+    }
+  ],
+  "flows": [],
+  "constraints": {},
+  "references": [],
+  "provenance": {
+    "authors": [{ "id": "derek", "name": "Derek" }],
+    "unresolved_questions": [
+      {
+        "id": "q_auth",
+        "path": "constraints.auth",
+        "reason": "undecided between SSO and bearer tokens",
+        "state": "unanswerable",
+        "created_at": "2026-04-10T09:00:00.000Z"
+      },
+      {
+        "id": "q_retention",
+        "path": "constraints.data_retention",
+        "reason": "compliance team not consulted yet",
+        "state": "unanswerable",
+        "created_at": "2026-04-10T09:00:00.000Z"
+      }
+    ]
+  },
+  "extensions": {
+    "reddwarf:project_spec": {
+      "sourceRepo": "derekrivers/flag-service"
+    }
+  }
+}

@@ -35,6 +35,7 @@ export const specs = contextSchema.table('specs', {
     .default('draft'),
   schemaVersion: text('schema_version').notNull(),
   specJson: jsonb('spec_json').notNull(),
+  version: integer('version').notNull().default(1),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   lockedBy: uuid('locked_by').references(() => users.id, { onDelete: 'set null' }),

@@ -1,0 +1,108 @@
+{
+  "schema_version": "0.1",
+  "id": "22222222-2222-4222-8222-222222222222",
+  "title": "Invoice tracker",
+  "status": "ready",
+  "created_at": "2026-03-01T10:00:00.000Z",
+  "updated_at": "2026-04-19T11:30:00.000Z",
+  "intent": {
+    "summary": "Small-team invoice tracker.",
+    "problem": "Accounts teams juggle invoices across email, shared drives, and a ledger spreadsheet; reconciliation is painful and late payments slip through.",
+    "users": [
+      { "id": "ap_clerk", "persona": "Accounts-payable clerk", "needs": "Capture invoices from email quickly." },
+      { "id": "ap_manager", "persona": "AP manager", "needs": "Visibility into approvals and exceptions." }
+    ],
+    "non_goals": ["Accounts receivable.", "Multi-currency conversion math."]
+  },
+  "domain_model": {
+    "entities": [
+      { "id": "invoice", "name": "Invoice", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "amount_cents", "type": "integer", "required": true },
+        { "name": "status", "type": "enum(received|approved|paid|disputed)", "required": true }
+      ]},
+      { "id": "vendor", "name": "Vendor", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "name", "type": "string", "required": true }
+      ]},
+      { "id": "approver", "name": "Approver", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "email", "type": "string", "required": true }
+      ]},
+      { "id": "payment", "name": "Payment", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "method", "type": "string" }
+      ]},
+      { "id": "note", "name": "Note", "fields": [
+        { "name": "id", "type": "uuid", "required": true },
+        { "name": "body", "type": "text" }
+      ]}
+    ],
+    "relationships": [
+      { "id": "vendor_has_invoices", "from_entity": "vendor", "to_entity": "invoice", "kind": "one_to_many" },
+      { "id": "invoice_has_payments", "from_entity": "invoice", "to_entity": "payment", "kind": "one_to_many" }
+    ]
+  },
+  "capabilities": [
+    { "id": "receive_invoice", "name": "Receive invoice", "entity_ref": "invoice", "verb": "ingest", "acceptance_criteria": [
+      { "id": "from_email", "given": "an AP clerk", "when": "forwards an invoice email", "then": "an invoice record is created with vendor matched or flagged" }
+    ]},
+    { "id": "approve_invoice", "name": "Approve invoice", "entity_ref": "invoice", "verb": "approve", "acceptance_criteria": [
+      { "id": "manager_approves", "given": "an invoice in received state", "when": "an approver approves", "then": "status becomes approved and a payment record is queued" }
+    ]},
+    { "id": "dispute_invoice", "name": "Dispute invoice", "entity_ref": "invoice", "verb": "dispute", "acceptance_criteria": [
+      { "id": "disputed_holds", "given": "a disputed invoice", "when": "a clerk files a dispute", "then": "payments are blocked until resolved" }
+    ]},
+    { "id": "record_payment", "name": "Record payment", "entity_ref": "payment", "verb": "record", "acceptance_criteria": [
+      { "id": "payment_flow", "given": "an approved invoice", "when": "payment is issued", "then": "status becomes paid" }
+    ]},
+    { "id": "annotate_invoice", "name": "Annotate invoice", "entity_ref": "note", "verb": "annotate", "acceptance_criteria": [] },
+    { "id": "reconcile_month", "name": "Reconcile month", "entity_ref": "invoice", "verb": "reconcile", "acceptance_criteria": [] },
+    { "id": "import_vendors", "name": "Import vendors", "entity_ref": "vendor", "verb": "import", "acceptance_criteria": [] },
+    { "id": "export_ledger", "name": "Export ledger", "entity_ref": "invoice", "verb": "export", "acceptance_criteria": [] }
+  ],
+  "flows": [
+    { "id": "invoice_lifecycle", "name": "Invoice lifecycle", "trigger": "An invoice email arrives", "steps": [
+      { "actor": "user", "action": "forwards email" },
+      { "actor": "system", "action": "parses attachment and matches vendor" },
+      { "actor": "user", "action": "reviews and approves" },
+      { "actor": "system", "action": "queues payment" }
+    ], "failure_modes": [
+      { "when": "vendor unknown", "behavior": "flag as needs_vendor_match" },
+      { "when": "amount missing", "behavior": "hold in exceptions queue" }
+    ]},
+    { "id": "dispute_resolution", "name": "Dispute resolution", "trigger": "AP opens a dispute", "steps": [
+      { "actor": "user", "action": "marks invoice disputed" },
+      { "actor": "system", "action": "blocks payment" },
+      { "actor": "user", "action": "resolves and updates status" }
+    ], "failure_modes": [
+      { "when": "dispute unresolved after 30 days", "behavior": "escalate to AP manager" }
+    ]},
+    { "id": "monthly_reconciliation", "name": "Monthly reconciliation", "trigger": "End of month", "steps": [
+      { "actor": "system", "action": "aggregates approved invoices" },
+      { "actor": "user", "action": "reviews totals" }
+    ], "failure_modes": [] }
+  ],
+  "constraints": {
+    "platform": "web",
+    "stack": { "frontend": "React", "backend": "Fastify", "database": "Postgres", "notes": "single-tenant for now" },
+    "auth": "SSO via IdP",
+    "data_retention": "7 years (statutory)",
+    "performance": "P95 under 500ms for list endpoints",
+    "compliance": "SOC2 Type II",
+    "deploy_posture": "VPC-private, operator-run"
+  },
+  "references": [
+    { "id": "ap_flow", "label": "Prior AP SOP", "url_or_path": "https://internal/wiki/ap-sop" },
+    { "id": "erp_docs", "label": "Finance ERP docs", "url_or_path": "https://internal/wiki/erp", "notes": "Target integration." }
+  ],
+  "provenance": {
+    "authors": [{ "id": "derek", "name": "Derek" }],
+    "unresolved_questions": []
+  },
+  "extensions": {
+    "reddwarf:project_spec": {
+      "sourceRepo": "derekrivers/invoice-tracker"
+    }
+  }
+}
