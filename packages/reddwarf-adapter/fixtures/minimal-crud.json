@@ -1,0 +1,121 @@
+{
+  "schema_version": "0.1",
+  "id": "11111111-1111-4111-8111-111111111111",
+  "title": "Todo tracker",
+  "status": "ready",
+  "created_at": "2026-04-01T12:00:00.000Z",
+  "updated_at": "2026-04-20T09:00:00.000Z",
+  "intent": {
+    "summary": "A minimal todo tracker for solo operators.",
+    "problem": "Users lose track of short-lived tasks across devices and forget them before acting.",
+    "users": [
+      { "id": "operator", "persona": "Solo operator", "needs": "Low-friction capture." }
+    ],
+    "non_goals": ["Team collaboration."]
+  },
+  "domain_model": {
+    "entities": [
+      {
+        "id": "todo",
+        "name": "Todo",
+        "fields": [
+          { "name": "id", "type": "uuid", "required": true },
+          { "name": "title", "type": "string", "required": true },
+          { "name": "done", "type": "boolean" }
+        ]
+      },
+      {
+        "id": "user",
+        "name": "User",
+        "fields": [
+          { "name": "id", "type": "uuid", "required": true },
+          { "name": "email", "type": "string", "required": true }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "id": "user_owns_todo",
+        "from_entity": "user",
+        "to_entity": "todo",
+        "kind": "one_to_many"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "id": "create_todo",
+      "name": "Create todo",
+      "entity_ref": "todo",
+      "verb": "create",
+      "acceptance_criteria": [
+        {
+          "id": "create_persists",
+          "given": "authenticated user",
+          "when": "submits a non-empty title",
+          "then": "a new todo appears in their list"
+        }
+      ]
+    },
+    {
+      "id": "list_todos",
+      "name": "List todos",
+      "entity_ref": "todo",
+      "verb": "list",
+      "acceptance_criteria": [
+        {
+          "id": "list_owned",
+          "given": "authenticated user",
+          "when": "visits the list view",
+          "then": "only their todos are visible"
+        }
+      ]
+    },
+    {
+      "id": "complete_todo",
+      "name": "Complete todo",
+      "entity_ref": "todo",
+      "verb": "complete",
+      "acceptance_criteria": [
+        {
+          "id": "complete_marks_done",
+          "given": "an open todo",
+          "when": "the user marks it complete",
+          "then": "it moves to the completed section"
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "add_first_todo",
+      "name": "Add first todo",
+      "trigger": "User opens the app for the first time",
+      "steps": [
+        { "actor": "user", "action": "types a title and presses enter" },
+        { "actor": "system", "action": "persists the todo and renders it" }
+      ],
+      "failure_modes": [
+        { "when": "title is empty", "behavior": "disable the submit button" }
+      ]
+    }
+  ],
+  "constraints": {
+    "platform": "web",
+    "stack": { "frontend": "React", "backend": "Fastify", "database": "Postgres" },
+    "auth": "bearer token",
+    "deploy_posture": "self-hosted"
+  },
+  "references": [
+    { "id": "todomvc", "label": "TodoMVC", "url_or_path": "https://todomvc.com" }
+  ],
+  "provenance": {
+    "authors": [{ "id": "derek", "name": "Derek" }],
+    "unresolved_questions": []
+  },
+  "extensions": {
+    "reddwarf:project_spec": {
+      "sourceRepo": "derekrivers/todo-tracker"
+    }
+  }
+}

@@ -36,6 +36,13 @@
       "when": 1776720000000,
       "tag": "0004_phase_direct_edit_retry",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1776730000000,
+      "tag": "0005_spec_version_counter",
+      "breakpoints": true
     }
   ]
 }

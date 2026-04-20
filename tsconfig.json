@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/spec-schema" },
-    { "path": "./packages/backend" }
+    { "path": "./packages/backend" },
+    { "path": "./packages/reddwarf-adapter" }
   ]
 }
