@@ -1,6 +1,6 @@
 import type { CanonicalSpec } from './schema.js'
 
-export type Importance = 'high' | 'medium' | 'low'
+export type Importance = 'critical' | 'high' | 'medium' | 'low'
 
 export type SectionKey =
   | 'intent'
@@ -34,6 +34,7 @@ export const SECTION_PRIORITY: Record<SectionKey, number> = {
 }
 
 export const IMPORTANCE_WEIGHT: Record<Importance, number> = {
+  critical: 4,
   high: 3,
   medium: 2,
   low: 1,
@@ -43,14 +44,14 @@ export const FIELD_META: readonly FieldMeta[] = [
   {
     path: 'intent.summary',
     section: 'intent',
-    importance: 'high',
+    importance: 'critical',
     kind: 'scalar',
     description: 'A one-line description of what is being built.',
   },
   {
     path: 'intent.problem',
     section: 'intent',
-    importance: 'high',
+    importance: 'critical',
     kind: 'scalar',
     description: 'The problem this system exists to solve.',
   },
@@ -73,7 +74,7 @@ export const FIELD_META: readonly FieldMeta[] = [
   {
     path: 'domain_model.entities',
     section: 'domain_model',
-    importance: 'high',
+    importance: 'critical',
     kind: 'collection',
     minElements: 1,
     description: 'At least one entity in the domain model.',
