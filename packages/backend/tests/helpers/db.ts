@@ -18,6 +18,12 @@ export function integrationConfig(): AppConfig {
       poolMax: 5,
     },
     adminToken: 'test-admin-token-0123456789',
+    anthropicApiKey: process.env['ANTHROPIC_API_KEY'] ?? 'test-anthropic-key',
+    phraseModel: 'claude-haiku-4-5-20251001',
+    parseModel: 'claude-sonnet-4-6',
+    llmTimeoutMs: 30000,
+    maxTurnsPerSpec: 60,
+    maxTokensPerSpec: 500000,
   }
 }
 

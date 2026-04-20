@@ -18,16 +18,18 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && mkdir -p dist/conversation/prompts && cp src/conversation/prompts/*.md dist/conversation/prompts/",
     "clean": "rm -rf dist *.tsbuildinfo",
     "start": "node dist/index.js",
     "dev": "node --watch --enable-source-maps dist/index.js",
     "test": "vitest run",
+    "test:live": "RUN_LIVE_LLM_TESTS=1 vitest run",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node dist/db/migrate.js",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
     "@context/spec-schema": "workspace:*",
     "drizzle-orm": "^0.40.0",
     "fastify": "^5.1.0",

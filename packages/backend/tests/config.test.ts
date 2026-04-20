@@ -4,6 +4,7 @@ import { loadConfig } from '../src/config.js'
 const baseEnv = {
   CONTEXT_PG_PASSWORD: 'secret',
   CONTEXT_ADMIN_TOKEN: 'a'.repeat(32),
+  ANTHROPIC_API_KEY: 'sk-ant-test',
 }
 
 describe('loadConfig', () => {
@@ -22,7 +23,24 @@ describe('loadConfig', () => {
   })
 
   it('throws when CONTEXT_PG_PASSWORD is missing', () => {
-    expect(() => loadConfig({})).toThrow(/CONTEXT_PG_PASSWORD/)
+    expect(() => loadConfig({ CONTEXT_ADMIN_TOKEN: 'a'.repeat(32), ANTHROPIC_API_KEY: 'k' })).toThrow(
+      /CONTEXT_PG_PASSWORD/,
+    )
+  })
+
+  it('throws when ANTHROPIC_API_KEY is missing', () => {
+    expect(() =>
+      loadConfig({ CONTEXT_PG_PASSWORD: 'secret', CONTEXT_ADMIN_TOKEN: 'a'.repeat(32) }),
+    ).toThrow(/ANTHROPIC_API_KEY/)
+  })
+
+  it('provides sensible model defaults', () => {
+    const c = loadConfig({ ...baseEnv })
+    expect(c.phraseModel).toBe('claude-haiku-4-5-20251001')
+    expect(c.parseModel).toBe('claude-sonnet-4-6')
+    expect(c.llmTimeoutMs).toBe(30000)
+    expect(c.maxTurnsPerSpec).toBe(60)
+    expect(c.maxTokensPerSpec).toBe(500000)
   })
 
   it('coerces numeric vars from strings', () => {
@@ -45,9 +63,15 @@ describe('loadConfig', () => {
   })
 
   it('requires CONTEXT_ADMIN_TOKEN and enforces min length', () => {
-    expect(() => loadConfig({ CONTEXT_PG_PASSWORD: 'secret' })).toThrow(/CONTEXT_ADMIN_TOKEN/)
     expect(() =>
-      loadConfig({ CONTEXT_PG_PASSWORD: 'secret', CONTEXT_ADMIN_TOKEN: 'short' }),
+      loadConfig({ CONTEXT_PG_PASSWORD: 'secret', ANTHROPIC_API_KEY: 'k' }),
+    ).toThrow(/CONTEXT_ADMIN_TOKEN/)
+    expect(() =>
+      loadConfig({
+        CONTEXT_PG_PASSWORD: 'secret',
+        CONTEXT_ADMIN_TOKEN: 'short',
+        ANTHROPIC_API_KEY: 'k',
+      }),
     ).toThrow(/CONTEXT_ADMIN_TOKEN/)
   })
 })

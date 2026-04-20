@@ -67,9 +67,10 @@ describe.skipIf(!dbReachable)('nextTurn (engine)', () => {
     const { id } = await createSpec(app, alice.token)
 
     const result = await nextTurn(db, id)
-    expect(result).not.toBeNull()
-    expect(result!.turnIndex).toBe(0)
-    expect(result!.selection.targetField.path).toBe('intent.summary')
+    expect(result.kind).toBe('selection')
+    if (result.kind !== 'selection') throw new Error('unreachable')
+    expect(result.turnIndex).toBe(0)
+    expect(result.selection.targetField.path).toBe('intent.summary')
 
     const rows = await db.client
       .select()
@@ -93,9 +94,9 @@ describe.skipIf(!dbReachable)('nextTurn (engine)', () => {
     const b = await nextTurn(db, id)
     const c = await nextTurn(db, id)
 
-    expect(a!.turnIndex).toBe(0)
-    expect(b!.turnIndex).toBe(1)
-    expect(c!.turnIndex).toBe(2)
+    expect(a.kind === 'selection' && a.turnIndex).toBe(0)
+    expect(b.kind === 'selection' && b.turnIndex).toBe(1)
+    expect(c.kind === 'selection' && c.turnIndex).toBe(2)
 
     const rows = await db.client
       .select()
@@ -110,14 +111,17 @@ describe.skipIf(!dbReachable)('nextTurn (engine)', () => {
     const { id, spec } = await createSpec(app, alice.token)
 
     const first = await nextTurn(db, id)
-    expect(first!.selection.targetField.path).toBe('intent.summary')
+    expect(first.kind === 'selection' && first.selection.targetField.path).toBe(
+      'intent.summary',
+    )
 
     const next: CanonicalSpec = { ...spec, intent: { ...spec.intent, summary: 'Something' } }
     await db.client.update(specs).set({ specJson: next }).where(eq(specs.id, id))
 
     const second = await nextTurn(db, id)
-    expect(second!.selection.targetField.path).not.toBe('intent.summary')
-    expect(second!.selection.targetField.section).toBe('intent')
+    if (second.kind !== 'selection') throw new Error('unreachable')
+    expect(second.selection.targetField.path).not.toBe('intent.summary')
+    expect(second.selection.targetField.section).toBe('intent')
   })
 
   it('returns null without writing a row when the spec is sufficiently complete', async () => {
@@ -178,7 +182,7 @@ describe.skipIf(!dbReachable)('nextTurn (engine)', () => {
     await db.client.update(specs).set({ specJson: complete }).where(eq(specs.id, id))
 
     const result = await nextTurn(db, id)
-    expect(result).toBeNull()
+    expect(result.kind).toBe('complete')
 
     const rows = await db.client
       .select()
