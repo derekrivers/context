@@ -1167,11 +1167,1075 @@ Flag these in the PR description:
 - Whether to include a "copy spec id" affordance on the list row. Not required; mildly useful for debugging.
 
 
-### T-08 — Three-pane authoring UI
+# T-08a — Authoring Layout Shell + Conversation Pane
 
-The primary surface. Conversation pane left (40%), structured spec pane centre (40%, always in sync with backend), contextual right pane (20%) showing validation messages and unresolved questions. Responsive fallback to a tabbed layout below 1280px. Conversation turns appear optimistically and reconcile on backend confirmation. Every spec field editable in place with debounced PATCH saves. Per-section completeness indicators update live. "Export JSON" downloads the canonical spec. "Send to RedDwarf" action wired through T-10. Lock contention surfaces as a read-only banner with the holder's name.
+You are implementing ticket **T-08a**, the first of three tickets that together deliver the three-pane authoring UI. This ticket establishes the layout scaffold and delivers a fully working conversation pane. The structured-spec pane (T-08b) and the context/right pane (T-08c) are stubbed here and become real in their respective tickets.
 
-**Done when:** you can produce a genuine spec in 45 minutes of conversation that reads back as "yes, that's what I meant."
+This ticket depends on T-01 (schema), T-02 (backend), T-03 (auth), T-04 (spec CRUD + lock), T-05 (state machine), T-06 (LLM adapters), T-07 (frontend scaffold). T-04a (sharing) is soft-required — share-aware behaviour no-ops gracefully if absent. T-09/T-10 are not required.
+
+---
+
+## Repository reminder
+
+Context is a standalone repo at `github.com/derekrivers/context`. All frontend code lives in `packages/frontend/`. T-08a extends the scaffold from T-07. No new dependencies beyond those in T-07 (Tailwind, shadcn, TanStack Query, TanStack Router, Zod, Vitest). No RedDwarf imports, no RedDwarf env vars.
+
+---
+
+## Scope
+
+### In
+- The three-pane layout shell (CSS grid, responsive tabbed fallback).
+- Persistent header with spec title (editable in place), lock banner, access banner, Export JSON button, feature-flagged Send to RedDwarf button.
+- Lock acquisition and lease renewal on route load.
+- The complete conversation pane: turn rendering for all five card types, confidence display, contradiction handling, retry/skip/unknown affordances, input bar with loading states, turn-cap terminal state.
+- TanStack Query hooks covering specs, turns, lock, shares — shared with T-08b and T-08c.
+
+### Out (deferred to T-08b)
+- The structured spec pane. T-08a renders an empty placeholder pane centre.
+- Per-section completeness bars — these render in T-08c's pane 3, which reads from the same query.
+- Direct-field edits, Zod validation UX, array-of-objects UI, unknown-field-shell.
+
+### Out (deferred to T-08c)
+- Right pane content: overall completeness block, next-action card, unresolved questions list, activity feed. T-08a renders a placeholder pane right with "Context pane — T-08c" text.
+
+### Out (permanently — per MVP plan)
+- Real-time collaboration, SSE/websockets, dark mode, version-history UI.
+
+---
+
+## Layout shell
+
+A three-pane layout on screens ≥ 1280px:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│   Header (spec title, banners, export, send, back link)              │
+├──────────────────────────┬──────────────────────────┬────────────────┤
+│                          │                          │                │
+│   Conversation (40%)     │   [placeholder] (40%)    │   [plc] (20%)  │
+│                          │                          │                │
+└──────────────────────────┴──────────────────────────┴────────────────┘
+```
+
+Below 1280px: tabbed layout with three tabs — **Conversation**, **Spec**, **Context**. Default tab is Conversation. The header remains fixed above the tabs. Below 768px, the header compresses the logout into a menu (acceptable, not required).
+
+Use CSS grid for desktop. No third-party split-pane library. Pane widths fixed at 40/40/20 — no draggable dividers in v0.1.
+
+Placeholder panes render a single centred line of muted text naming which ticket delivers them. Functional enough to ship T-08a without them being broken-looking.
+
+---
+
+## Header
+
+Spans all three panes. Contents:
+
+- **Back link** to `/specs` (left).
+- **Spec title** editable in place. Shows `intent.summary` by default; placeholder "Untitled spec". PATCHes via `PATCH /specs/:id` with a 500ms debounce. Tiny "Saved" indicator beside for 1s after success.
+- **Status chip** (right side of title): `draft` / `in_progress` / `complete` / `archived`.
+- **Lock banner** beneath header (see below).
+- **Access banner** beneath header (see below).
+- **Export JSON button** (right). Downloads the canonical spec as `<spec-id>-<YYYY-MM-DD>.json` via Blob + anchor click. No backend endpoint — data's already client-side.
+- **Send to RedDwarf button** (right). Feature-flagged behind `VITE_CONTEXT_SEND_TO_REDDWARF_ENABLED`. Default `false`. When `false`, button does not render. When `true`, clicking opens a modal placeholder that says "Requires T-09/T-10" if those aren't live, or (once they are) shows the ProjectSpec payload preview and confirm flow.
+
+---
+
+## Lock and access banners
+
+### Lock acquisition
+
+On route load: `POST /specs/:id/lock`. Handle three outcomes:
+
+- **200 / 201 — lock acquired by current user.** No banner. Editing enabled.
+- **409 — lock held by someone else.** Render read-only banner beneath header: "Locked by {holder.display}. Their lease expires in {remaining_minutes}m." Poll the lock state every 30s via `GET /specs/:id/lock`. When the lock releases, the banner disappears and editing re-enables without a page reload. Do not attempt to re-acquire automatically — the user might have navigated away; require a user action (e.g., reloading) or let the next mutation attempt acquire naturally.
+- **404 / 500** — surface as a global error banner; editing disabled until resolved.
+
+### Lease renewal
+
+While the current user holds the lock and the tab is visible (visibilitychange listener), renew the lease every 2 minutes via the existing lock endpoint. Pause renewal when the tab is hidden.
+
+### Lock release
+
+Release on route unmount, on `beforeunload`, and on explicit "Leave" action (if any). Use `navigator.sendBeacon` for the `beforeunload` release — it survives tab close where a normal fetch wouldn't.
+
+### Access banner (T-04a aware)
+
+If T-04a is landed and the current user is viewing a shared spec:
+
+- Access `viewer`: banner reads "Shared with you by {owner.display} — read-only." All editing disabled across the authoring UI. Lock is not acquired.
+- Access `editor`: banner reads "Shared with you by {owner.display}." Editing enabled; lock is acquired normally.
+- Owner: no banner.
+
+If T-04a isn't landed, the `GET /specs/:id` response won't include an access field, in which case the code treats the caller as owner and no banner renders.
+
+---
+
+## Conversation pane (the main deliverable)
+
+### Turn rendering
+
+Each turn is a card in a scrollable list. Five card types map 1:1 to the T-05 phases:
+
+**SelectionCard** — shows the phrased question from T-06's `phraseQuestion`. One-line footer in muted italic: "About: `<section>.<path>`". Helps the user see what field is being targeted.
+
+**AnswerCard** — the user's free-text answer. Visually distinct from assistant cards (e.g. right-aligned, different border). Contains a confidence chip if `FieldUpdate.confidence` is `medium` or `low`; `high` renders nothing. Confidence chip is muted, small, text-labelled ("medium confidence").
+
+**ClarificationCard** — the follow-up question from a `clarification` parse outcome. Visually similar to a SelectionCard but with a small "Clarifying" badge and a muted border colour. The original AnswerCard that triggered the clarification remains visible above — do not remove the user's text.
+
+**SkipCard** — compact single-line "Skipped for now" marker. Includes an "Unskip" link that calls the T-05 unskip endpoint.
+
+**UnknownCard** — renders the user's acknowledged unknown with the reason they gave. Same visual language as an AnswerCard with a small "Unknown" chip.
+
+Cards render top-down in `turn_index` order. Latest at the bottom. Auto-scroll to bottom on new turns **except** when the user has scrolled up — respect scroll position as a signal.
+
+### ContradictionCard (special case of clarification)
+
+When `parseAnswer` returns `clarification` with `reason: "contradicts_existing_spec"`, render a ContradictionCard instead of a normal ClarificationCard:
+
+- Header: "This conflicts with what you said earlier."
+- Body: shows the old value (at path X) and the new value from the parsed answer.
+- Two primary buttons: "Keep old value" (discards new answer, records a turn, moves on) and "Use new value" (applies update, records a turn, moves on).
+- Below the buttons, the model's follow-up question text in case the user wants to type a third option.
+
+This is the only place in the UI where the user gets a binary choice on a spec value. Everything else is either free-text answering (here) or direct editing (T-08b).
+
+### Retry budget exhaustion
+
+When T-05 drops a field from the candidate set after 3 unparseable attempts, it surfaces in the right pane (T-08c) as an unresolved question. No special card in the conversation — the conversation simply moves on to the next selectable field.
+
+### Turn cap / token cap reached
+
+When `nextTurn` returns `{ kind: "turn_cap_reached" }`, render a terminal card at the bottom:
+
+> **We've talked through this for a while.**
+> Review the spec on the right. If there's more to add, you can edit it directly or raise unresolved questions. To continue the conversation, an operator needs to raise the turn cap for this spec.
+
+No "continue anyway" button. The input disables. The user can still direct-edit in the structured pane (once T-08b lands) without consuming turns.
+
+### Input bar
+
+Fixed at the bottom of the conversation pane:
+
+- Textarea, auto-grows to 5 lines max then scrolls internally.
+- Primary "Send" button.
+- Secondary actions row above the textarea: "Skip this question" (T-05 skip endpoint) and "I don't know" (pre-fills textarea with "I don't know because..." and focuses the cursor).
+- **Enter** sends. **Shift+Enter** inserts newline. **Cmd/Ctrl+Enter** also sends.
+- While backend is generating or parsing, input is disabled and shows "Thinking…" indicator. Answers process strictly in order — no queueing.
+
+### Loading states during LLM calls
+
+- After user sends an answer: Send button → spinner, subtle "Parsing your answer…" line below input.
+- After turn completes, next selection being phrased: placeholder SelectionCard with shimmer/pulse, labelled "Thinking of the next question…"
+- Timeout (504): inline error with Retry button. No turn persisted.
+- Rate limit (429): inline message "Paused briefly — the model is rate-limited. Retrying in a moment." Auto-retry once after 5s; if it fails, manual retry.
+
+### Optimistic updates (conversation only)
+
+- User's answer appears as an AnswerCard immediately on submit.
+- On backend success: optimistic card replaced with the backend-confirmed turn.
+- On `clarification` returned: optimistic answer stays, ClarificationCard appears below it.
+- On network failure: optimistic card shows a retry affordance, clearly not-yet-saved.
+
+Everything else in T-08a (completeness, turn history beyond the current burst, lock state) waits for backend confirmation. No optimistic updates on things the user can't correct.
+
+---
+
+## Sync model
+
+### Re-fetch on mutation
+
+No SSE, no websockets. Strategy:
+
+1. On route load: parallel fetches of spec, turns (last 50), lock state, shares (if T-04a).
+2. Any mutation invalidates the relevant TanStack Query keys.
+3. Refetch happens automatically.
+
+Multi-user editing via T-04a shares does not show live updates — only on refresh or after mutations by the current user. Real-time collaboration is explicitly out of scope.
+
+### Query keys (established in this ticket for later use)
+
+```ts
+['specs', specId]                 // full spec — T-08a, T-08b, T-08c all read
+['specs', specId, 'turns']        // conversation turns — T-08a writes, T-08c reads
+['specs', specId, 'completeness'] // T-08a unused, T-08b writes on edit, T-08c reads
+['specs', specId, 'unresolved']   // T-08c
+['specs', specId, 'lock']         // T-08a
+['specs', specId, 'shares']       // T-08a reads if T-04a present
+```
+
+Define all six in `packages/frontend/src/queries/authoring.ts` as part of T-08a so T-08b and T-08c plug in without re-architecting.
+
+---
+
+## Keyboard shortcuts
+
+- **Enter** (in input): send answer.
+- **Shift+Enter** (in input): newline.
+- **Cmd/Ctrl+Enter** (in conversation pane): send answer.
+- **Esc** (in title field): blur without saving; revert.
+- **Cmd/Ctrl+S** (with title focused): flush debounce, save immediately.
+
+No global palette, no vim bindings, no `?` help.
+
+---
+
+## Error recovery
+
+- **LLM timeout (504):** inline conversation error, retry button. No turn persisted.
+- **Rate limit (429):** inline, auto-retry once, then manual.
+- **Backend 500 on title PATCH:** field shows error, reverts optimistic update.
+- **Network offline:** top banner "Offline — changes aren't saving." Re-enable on reconnect; user must manually re-save.
+- **Lock lost mid-edit:** banner appears, editing disables. Any in-flight mutation that returns 409 surfaces lock-holder info.
+- **Session expiry (401):** token cleared, redirect to `/login` (T-07 pattern). Toast on login: "Your session expired; any unsaved changes were lost."
+
+---
+
+## Accessibility
+
+- Every pane has a landmark role: `main` for the layout root, `region` with aria-labels for each pane.
+- Every field has a visible label.
+- Focus managed on tab collapse/expand — don't strand keyboard users inside a collapsed section.
+- All interactive elements reachable via keyboard in sensible order.
+- Colour is never the only signal — confidence chips have text, status chips have text.
+- shadcn handles most ARIA out of the box; don't undo it.
+
+---
+
+## Component layout
+
+Files this ticket creates:
+
+```
+packages/frontend/src/
+├── routes/
+│   └── specs.$id.tsx                      # replaces the T-07 stub
+├── components/
+│   └── authoring/
+│       ├── AuthoringLayout.tsx            # 3-pane grid + tabbed fallback
+│       ├── AuthoringHeader.tsx            # title, banners, export, send
+│       ├── LockBanner.tsx
+│       ├── AccessBanner.tsx
+│       ├── ExportJsonButton.tsx
+│       ├── SendToRedDwarfButton.tsx       # feature-flagged shell
+│       ├── ConversationPane.tsx
+│       ├── ConversationInput.tsx
+│       ├── TerminalTurnCard.tsx           # turn-cap / token-cap
+│       └── turns/
+│           ├── SelectionCard.tsx
+│           ├── AnswerCard.tsx
+│           ├── ClarificationCard.tsx
+│           ├── ContradictionCard.tsx
+│           ├── SkipCard.tsx
+│           └── UnknownCard.tsx
+└── queries/
+    └── authoring.ts                        # all six query hooks
+```
+
+Placeholder components for the other two panes (delivered in T-08b and T-08c):
+
+```
+packages/frontend/src/components/authoring/
+├── StructuredPane.tsx     # placeholder: centred muted text "Spec pane — T-08b"
+└── ContextPane.tsx        # placeholder: centred muted text "Context pane — T-08c"
+```
+
+---
+
+## Handoff contract for T-08b and T-08c
+
+This ticket establishes interfaces the next two tickets plug into. Make these explicit:
+
+1. **Query keys and hooks** live in `queries/authoring.ts`. T-08b adds a `useUpdateField` mutation; T-08c adds a `useUnresolved` query and a `useRetryField` mutation. None of those require re-architecting T-08a's query layout.
+2. **`AuthoringLayout.tsx`** accepts three pane children as props: `<AuthoringLayout conversation={...} structured={...} context={...} />`. T-08b replaces the structured prop; T-08c replaces the context prop. T-08a wires placeholder components by default.
+3. **Read-only state** (from lock or viewer access) is exposed via a React context (`AuthoringReadOnlyContext`). T-08b will consume this to disable field editing; T-08c will consume it to disable retry/unknown actions in unresolved list.
+4. **Active-target tracking** — the current `target_path` from the latest selection turn is exposed via `AuthoringContext` (or similar named context). T-08b uses it to auto-expand the active section. T-08a does not itself consume this — it's for T-08b — but T-08a establishes the context provider and populates it.
+
+These contracts are non-negotiable for T-08a. T-08b and T-08c may extend but must not rewrite them.
+
+---
+
+## Tests
+
+Unit:
+- Debounce logic on title save fires exactly once per burst.
+- Auto-scroll respects user scroll-up, scrolls on new turns.
+- Lock lease renewal fires every 2 minutes when tab visible; pauses when hidden.
+- `navigator.sendBeacon` called on `beforeunload` to release lock.
+
+Component (React Testing Library):
+- `ConversationPane` renders each of the five card types with fixture data.
+- `ContradictionCard` fires the correct mutations on each button.
+- `ConversationInput` loading state disables the textarea during mutation.
+- `LockBanner` renders only when another user holds the lock; disappears on release.
+- `AccessBanner` renders based on the access field; absent when owner.
+- Export JSON button produces a file with the expected filename and JSON content.
+- `SendToRedDwarfButton` does not render when flag is false; renders placeholder modal when true.
+
+Integration (mocked API):
+- Full turn round-trip: user types, optimistic AnswerCard appears, backend responds, card reconciles.
+- Clarification round-trip: user types, optimistic AnswerCard appears, ClarificationCard appears below it, user resolves.
+- Contradiction round-trip: user types, ContradictionCard appears with old/new values, both button paths fire correct mutations.
+- Skip round-trip: user clicks skip, SkipCard appears, unskip action restores field to selection pool.
+- Turn cap reached: terminal card renders, input disables.
+
+---
+
+## Done when
+
+- On a 1920px viewport, the three-pane layout renders with conversation working and two placeholder panes visible.
+- On a 1024px viewport, the tabbed fallback renders with Conversation as the default tab.
+- Header spec title is editable and saves on debounce.
+- Lock is acquired on route load; banner appears for contended specs; lease renewal works; release on unmount / beforeunload works.
+- Access banner renders correctly for owner, viewer, editor cases when T-04a is present; is absent when T-04a is not.
+- All five conversation card types render correctly with realistic fixture data.
+- Contradictions get the binary-choice UI; both paths record turns.
+- Skip and unskip round-trip cleanly.
+- Confidence chips render for `medium` and `low`; absent for `high`.
+- Loading states during LLM calls are visible and block duplicate input.
+- Turn cap terminal card renders and disables input.
+- Export JSON produces a valid canonical spec file.
+- Send to RedDwarf button is hidden by default and behind the feature flag.
+- All handoff contracts for T-08b and T-08c are in place: query keys defined, layout accepts pane children as props, read-only context established, active-target context established.
+- ESLint, Prettier, `tsc --noEmit`, and `pnpm test` all pass.
+- You can run an entire conversation from empty spec to a natural terminal state (threshold met, or turn cap reached) without ever needing T-08b or T-08c to be implemented. The only thing missing is the ability to see and edit the structured spec itself.
+
+---
+
+## Non-negotiables
+
+- Tailwind + shadcn only. No new styling system, no new component library.
+- TanStack Query for every server interaction.
+- No SSE, no websockets.
+- `parseAnswer`'s four outcomes each get a distinct card type. Don't collapse them.
+- Lock contention is a hard read-only state.
+- Send to RedDwarf stays feature-flagged.
+- Every user-visible error is readable. No "An error occurred."
+- TypeScript strict.
+- Handoff contracts for T-08b and T-08c are non-negotiable — they are the interfaces the next two tickets plug into.
+- No RedDwarf code, no RedDwarf env vars.
+
+---
+
+## Out of scope (for this ticket)
+
+Flag and push back if asked to add any of these in T-08a:
+
+- The structured spec pane (T-08b).
+- The context/right pane (T-08c).
+- Per-section completeness bars.
+- Direct field editing, Zod inline error UX, array-of-objects UI.
+- Unresolved questions list, activity feed, next-action card.
+- The Retry endpoint for stuck fields — T-08c owns that.
+- All permanently-out-of-scope items from the parent T-08 plan: real-time collab, SSE, dark mode, version-history UI, forking, comments, file uploads, rich text.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- Exact colour assignments for confidence chips, status chips, card borders. Pick muted palettes; future design pass will refine.
+- Whether the contradiction card's "Use new value" immediately sends the update or queues behind a confirmation. I'd suggest immediate — the card itself is the confirmation.
+- Whether to use `<ResizeObserver>` or a CSS container query for the tabbed-layout breakpoint. Either works; pick what's simpler.
+- Whether `sendBeacon` needs an auth header workaround (it doesn't support custom headers in all browsers). If so, document the workaround or fall back to a synchronous fetch with `keepalive: true`.
+
+# T-08b — Structured Spec Pane
+
+You are implementing ticket **T-08b**, the second of three tickets that together deliver the three-pane authoring UI. T-08a established the layout shell, header, and conversation pane. T-08b replaces the placeholder centre pane with the live editable structured spec view. T-08c will replace the right placeholder pane.
+
+This ticket depends on T-08a being complete and merged. It also depends on T-01 (schema — specifically `@context/spec-schema` exposing the Zod schema in a form the frontend can traverse), T-02 (backend), T-04 (spec CRUD), T-05 (state machine — the `direct_edit` phase is a new addition here).
+
+---
+
+## Repository reminder
+
+Context is a standalone repo at `github.com/derekrivers/context`. All frontend code lives in `packages/frontend/`. T-08b extends T-08a — no new top-level dependencies. No RedDwarf imports, no RedDwarf env vars.
+
+---
+
+## Scope
+
+### In
+- Replace `StructuredPane.tsx` placeholder with the real implementation.
+- Vertical accordion of spec sections with auto-expand on active target.
+- In-place editing for every field in the canonical spec schema.
+- Debounced PATCH saves with inline Zod error feedback.
+- Array additions and deletions for entities, capabilities, flows.
+- `unknown` field rendering and "Set value" escape hatch.
+- Backend: add `phase: "direct_edit"` to the T-05 phase enum; every direct edit writes a turn row.
+- Optimistic updates on field saves with revert-on-failure.
+
+### Out (deferred to T-08c)
+- Per-section completeness bars visible in the right pane. T-08b is responsible for invalidating the completeness query on save so T-08c's UI updates; T-08b itself doesn't render the bars in the section headers. (It renders a compact progress marker inline with the section header — see "Section headers" — but the main completeness display is in T-08c.)
+- Unresolved questions list, activity feed, next-action card.
+
+### Out (permanently)
+- Array reordering via drag-and-drop.
+- Rich text in any field.
+- File/image uploads.
+- Inline preview for fields that reference other fields (e.g. showing a capability's dependent entities).
+- Undo/redo beyond what `spec_history` already captures.
+
+---
+
+## Consuming T-08a's handoff contracts
+
+T-08a established four contracts this ticket plugs into. Re-read them in T-08a's prompt if needed.
+
+1. **Query keys in `queries/authoring.ts`.** T-08b adds a `useUpdateField` mutation that takes `(specId, path, value)` and PATCHes the spec. On success, it invalidates `['specs', specId]` and `['specs', specId, 'completeness']`. On failure, it surfaces the Zod error to the calling field.
+2. **`AuthoringLayout`** accepts a `structured` child prop. T-08b passes the new `<StructuredPane />` in place of the placeholder.
+3. **`AuthoringReadOnlyContext`.** T-08b consumes this. When read-only, every field renders as plain text (no input), no "+ Add" buttons, no "Set value" actions, no "Remove" on array items.
+4. **`AuthoringContext.activeTargetPath`.** T-08b consumes this to auto-expand the section containing the current target field. When the active target changes, the accordion expands that section and optionally smooth-scrolls the field into view. Don't force-collapse the previously active section — let the user control expand state beyond the initial auto-expand.
+
+---
+
+## Section navigation
+
+The canonical spec has six top-level sections plus two meta sections:
+
+- `intent` (summary, problem, users, non_goals)
+- `domain_model` (entities[])
+- `capabilities` (capabilities[])
+- `flows` (flows[])
+- `constraints` (platform, stack, auth, data_retention, performance, compliance, deploy_posture)
+- `references` (references[])
+- `provenance` (read-only always)
+- `extensions` (advanced, collapsed by default, hidden behind a "Show advanced" toggle in the section list footer)
+
+### Section headers
+
+Each section header:
+- Section name (larger, bold).
+- Compact progress marker on the right: a small pill showing "X of Y" where X is fields with values and Y is total required-ish fields in that section. Use `computeCompleteness(spec)` from `@context/spec-schema` to derive. This is a compact visual — the full completeness bars are in T-08c's pane 3.
+- Expand/collapse chevron.
+- Sticky behaviour: while a section is expanded and the user scrolls within it, the header remains pinned at the top of the scroll area.
+
+### Expansion behaviour
+
+- On route load: expand `intent` by default plus the section containing the active target, if any.
+- On active-target change (new selection turn): auto-expand that section if collapsed. Do not collapse others.
+- User clicks: toggles that section freely. User state beats auto-expansion for subsequent selections — if the user has manually collapsed a section, don't re-expand it on the next turn unless they click again.
+- `provenance` section: always visible, always collapsed by default, expand on click only. Never auto-expand.
+- `extensions` section: hidden behind "Show advanced" at the bottom of the section list.
+
+---
+
+## Field rendering
+
+One dispatch point: `components/authoring/structured/FieldRenderer.tsx`. Given a path in the spec and the Zod schema at that path, it returns the correct field component. Don't scatter `if (type === 'string')` branches through parent components.
+
+### Field types
+
+**String (single-line)** — `<StringField />`. Input element. Debounced save on change, save on blur, save on Cmd/Ctrl+S.
+
+**String (multi-line)** — `<TextareaField />`. Same save behaviour. Auto-grow to 8 lines then scroll. Used for fields marked multi-line in the schema (e.g. `intent.problem`, `intent.summary` if long).
+
+**Enum** — `<EnumField />`. Select dropdown with options from the Zod enum. Save on change (no debounce needed).
+
+**Boolean** — `<BooleanField />`. Toggle. Save on change.
+
+**Number** — `<NumberField />`. Input with `type="number"`. Debounced save. Zod validates numeric bounds.
+
+**Array of primitives** — `<ChipArrayField />`. Chip input — type a value, press Enter, chip appears. Each chip has a remove affordance. Save the full array on each mutation.
+
+**Array of objects** — `<ObjectArrayField />`. List of subcards, one per item. Each subcard:
+- Object fields rendered inline using the same `FieldRenderer` recursion.
+- A remove button (trash icon) at the top right. Confirms with a subtle inline "Are you sure?" state — no modal.
+- A collapse/expand chevron if the object has more than 3 fields.
+At the bottom of the list: "+ Add {singular}" button. Creates a new object with all required fields set to empty/unknown defaults per the schema, then scrolls the new subcard into view and focuses the first field.
+
+**Object** — `<ObjectField />`. Nested fieldset. If the object has > 3 fields, it gets its own collapsible header. Otherwise renders inline with no wrapper.
+
+### Field labels and help text
+
+- Every field has a visible label derived from the Zod schema's `.describe()` call (T-01 should have set these on every field).
+- Optional help text appears below the input in muted small text, derived from a convention like the second line of `.describe()` or a separate metadata field. T-01 guidance needed here — if T-01 didn't settle it, pick a convention and document it in the PR description.
+- Importance annotation (from T-05) does not appear in the UI in v0.1 — it's a backend-only signal.
+
+---
+
+## `unknown` fields
+
+A field with value `{ unknown: true, reason: "..." }` renders with a dedicated shell: `<UnknownFieldShell />`.
+
+Shell contents:
+- Dashed border around the field area instead of solid.
+- "Unknown" in muted italic where the value would be.
+- The reason shown below in smaller muted text.
+- A "Set value" link that clears the unknown marker locally and replaces the shell with the normal field component. The first edit to the normal field triggers a save that removes the unknown marker and writes the new value.
+
+An editable field also offers the reverse — a small "Mark unknown" icon in the corner of every field that, when clicked, prompts for a reason (inline popover, one-line input) and writes `{ unknown: true, reason }` on confirm.
+
+---
+
+## Direct edits and the turn log
+
+**Every direct edit writes a turn row** with `phase: "direct_edit"`. This is a new phase added to the T-05 enum.
+
+### Backend addition
+
+Add a new migration that extends the phase CHECK constraint on `context.conversation_turns` to include `direct_edit`. Or, if the column is text without a CHECK, just start writing the new value.
+
+Add a dedicated internal helper (not a new HTTP endpoint — the existing `PATCH /specs/:id` is the surface). The T-04 PATCH handler, on successful save, writes a turn with:
+
+- `phase: "direct_edit"`
+- `target_path`: the JSONPath of the edited field
+- `target_section`: the top-level section
+- `spec_snapshot`: the full spec after the edit
+- `completeness_snapshot`: recomputed
+- `outcome`: `"answered"` (direct edits are always terminal — no pending selection to back-fill)
+- `llm_model_id`, `llm_tokens_in`, `llm_tokens_out`: all null (no LLM involved)
+- `selection_reason`: null
+
+If a single PATCH updates multiple fields at once (some Zod validators allow batch PATCHes), write one turn per field changed. Or one turn per PATCH with a list of paths in a new `target_paths` column — pick whichever is consistent with T-05's existing shape. Flag the choice in the PR description.
+
+### Frontend behaviour
+
+Direct edits do not render as cards in the conversation pane. T-08c's activity feed will display them alongside LLM-driven turns so the user sees their own edit history in timeline.
+
+---
+
+## Optimistic updates and revert
+
+On every field edit:
+
+1. Local state updates immediately.
+2. TanStack Query mutation fires with the new value.
+3. On success: the query invalidates and refetches; local state is replaced by backend state. Tiny "Saved" indicator for 1s.
+4. On Zod failure (422 from backend): local state keeps the user's invalid input so they can correct it. The error message from the backend response renders inline below the field in red. The spec itself (backend state) is unchanged.
+5. On other backend errors (500, network): local state reverts to the last known backend value. Top banner surfaces the error with retry instructions.
+6. On lock contention (409): banner from T-08a takes over; the authoring view becomes read-only.
+
+---
+
+## Validation feedback
+
+- Zod validation is **backend-authoritative**. Do not duplicate validation client-side beyond trivial things like "number input rejects non-numeric characters."
+- When the backend returns a 422 with a Zod error path and message, the field at that path renders the error inline below the input, in red, with a small warning icon.
+- Multiple errors on different fields show simultaneously.
+- T-08c's right pane will also list validation errors so they're not missed if the user has scrolled away — T-08b is responsible for exposing them via the query state; T-08c is responsible for rendering the list.
+- The "Saved" indicator only fires on actual success, not on "saved locally but invalid" states.
+
+---
+
+## Read-only mode
+
+If `AuthoringReadOnlyContext` reports read-only (lock held by another user, or viewer-access share):
+
+- Every field renders in a read-only presentation: value visible, no input element. For strings, render as plain text. For arrays, render as a bulleted list or chips without remove affordances. For booleans, render "Yes" / "No" or similar.
+- No "+ Add" buttons.
+- No "Set value" or "Mark unknown" actions.
+- No remove affordances on array items.
+- `unknown` fields still show their shell but without the "Set value" link.
+
+Re-enabling after lock release happens automatically via the context — T-08b doesn't need to coordinate directly with the lock polling from T-08a.
+
+---
+
+## Component layout
+
+Files this ticket creates:
+
+```
+packages/frontend/src/components/authoring/
+├── StructuredPane.tsx                    # replaces T-08a placeholder
+├── structured/
+│   ├── FieldRenderer.tsx                 # dispatch by Zod schema type
+│   ├── SectionAccordion.tsx              # one per top-level section
+│   ├── SectionHeader.tsx                 # name, progress pill, chevron
+│   ├── StringField.tsx
+│   ├── TextareaField.tsx
+│   ├── EnumField.tsx
+│   ├── BooleanField.tsx
+│   ├── NumberField.tsx
+│   ├── ChipArrayField.tsx
+│   ├── ObjectArrayField.tsx
+│   ├── ObjectField.tsx
+│   ├── UnknownFieldShell.tsx
+│   ├── MarkUnknownPopover.tsx
+│   └── index.ts                          # FieldRenderer entry
+└── (reuse everything from T-08a)
+```
+
+Backend files this ticket touches:
+
+```
+packages/backend/src/
+├── migrations/
+│   └── 2026xxxxx_add_direct_edit_phase.sql   # if T-05 enum is CHECK-constrained
+├── routes/
+│   └── specs.patch.ts                        # extended to write direct_edit turns
+└── conversation/
+    └── turns.ts                              # new helper: writeDirectEditTurn()
+```
+
+---
+
+## Tests
+
+Unit:
+- `FieldRenderer` picks the correct component for each Zod type (string, textarea, enum, boolean, number, array primitive, array object, object).
+- Debounce on field saves fires exactly once per burst.
+- Optimistic update reverts on save failure.
+- Local state preservation on Zod error.
+- `UnknownFieldShell` "Set value" transitions correctly.
+
+Component (React Testing Library):
+- Each field component round-trips value, onChange, save-on-blur.
+- `SectionAccordion` auto-expands on active-target change without collapsing user-expanded sections.
+- `ObjectArrayField` add/remove operations work; new items focus correctly.
+- Read-only context disables all edit affordances.
+- Inline error rendering appears on 422 response.
+
+Integration (mocked API):
+- Full direct-edit round-trip: user types in field, optimistic update, PATCH fires, `direct_edit` turn written, local state reconciles.
+- Zod error round-trip: user types invalid value, PATCH fires, 422 returned, field shows error, local state preserved.
+- Array add round-trip: user clicks "+ Add", new item appears, default fields render, save fires.
+
+Backend:
+- `PATCH /specs/:id` writes a `direct_edit` turn on success.
+- `PATCH /specs/:id` does not write a turn on Zod failure.
+- Multi-field PATCH writes correct turn(s) per the shape decision.
+
+---
+
+## Done when
+
+- The structured pane replaces the T-08a placeholder.
+- All six sections + provenance + extensions render with correct collapse/expand behaviour.
+- Every field in a realistic CRUD-app fixture spec is editable and saves correctly.
+- Auto-expand on active-target change works without overriding user collapse state.
+- Zod errors render inline; local state preserves invalid input.
+- Array add/remove operations work for entities, capabilities, flows.
+- `unknown` fields render their shell correctly with working "Set value" and reverse "Mark unknown" actions.
+- Every direct edit produces a `conversation_turns` row with `phase: "direct_edit"` and correct snapshot data.
+- Read-only mode disables all editing affordances cleanly.
+- A user can complete a spec start-to-finish using only the structured pane (bypassing the conversation entirely) and the resulting data is identical in shape to a conversation-built spec.
+- ESLint, Prettier, `tsc --noEmit`, and `pnpm test` all pass.
+
+---
+
+## Non-negotiables
+
+- Tailwind + shadcn only.
+- TanStack Query for every server interaction.
+- Field type dispatch goes through `FieldRenderer` — no scattered type branches.
+- Zod validation stays backend-authoritative.
+- Every direct edit writes a `direct_edit` turn. No silent writes.
+- Read-only mode is a hard disable, not a soft warning.
+- TypeScript strict.
+- No new top-level dependencies.
+- No RedDwarf code.
+
+---
+
+## Out of scope
+
+Push back if asked to add any of these:
+
+- Right-pane content (T-08c owns all of it).
+- Drag-and-drop reordering of array items.
+- Rich text editing.
+- File/image uploads.
+- Field-level history or diff view (the data's in `spec_history` but rendering it is a later ticket).
+- Conditional fields (fields that appear only if another field has a specific value).
+- Field dependencies displayed inline (e.g. showing which capabilities reference which entity).
+- Real-time multi-user cursors.
+- Dark mode.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- One turn per direct edit, or one turn per PATCH with a list of paths. Pick whichever matches T-05's existing shape. If T-05's shape doesn't commit to either, one turn per edit is simpler.
+- Whether array removal requires confirmation or is immediate. Inline "Are you sure?" is what this prompt specifies; if you find that tedious in practice, immediate with undo is acceptable — document the change.
+- Exact visual treatment for `unknown` fields: dashed border is specified; colour choice is yours.
+- Whether `computeCompleteness` is called client-side for section-header progress pills, or the backend returns it on `GET /specs/:id`. Client-side is fine for this pill; the backend call happens in T-08c for the main bars anyway.
+- Whether the "Mark unknown" popover is a shadcn Popover or an inline form. Popover is more discoverable; inline is less disruptive.
+
+# T-08c — Context / Right Pane
+
+You are implementing ticket **T-08c**, the third and final ticket of the three-pane authoring UI. T-08a established the layout and conversation pane; T-08b added the structured spec pane and direct-edit turn logging. T-08c replaces the right placeholder pane with the real context pane: overall completeness, next-action card, unresolved questions, activity feed.
+
+This ticket depends on T-08a and T-08b being complete and merged. It also depends on T-01 (schema — `computeCompleteness` must be available), T-05 (state machine — unresolved questions live there), T-06 (LLM adapters — token/turn caps feed the next-action logic).
+
+---
+
+## Repository reminder
+
+Context is a standalone repo at `github.com/derekrivers/context`. All frontend code lives in `packages/frontend/`. T-08c extends T-08a and T-08b — no new top-level dependencies. No RedDwarf imports, no RedDwarf env vars.
+
+---
+
+## Scope
+
+### In
+- Replace `ContextPane.tsx` placeholder with the real implementation.
+- Four vertical sections, stacked: Overall completeness, Next action, Unresolved questions, Activity feed.
+- Backend: new endpoint `POST /specs/:id/fields/retry` for re-entering stuck fields into T-05's candidate set.
+- Backend: new endpoint `GET /specs/:id/unresolved` returning the list of fields dropped by T-05's retry budget or explicitly marked unanswerable.
+- Backend: extend `GET /specs/:id/turns` (from T-05) to support a `?recent=N` query param if not already there.
+- Frontend: click-to-navigate between right-pane elements and the structured pane (scrolls and expands the target section).
+
+### Out
+- No new conversation behaviour.
+- No changes to the structured pane beyond consuming its existing read-only state.
+- No version history UI beyond the activity feed's compact summary.
+- No analytics, no charts, no dashboards.
+
+---
+
+## Consuming T-08a and T-08b's handoff contracts
+
+T-08a established the query layout and layout-child-props pattern. T-08b added the completeness query invalidation and the `direct_edit` phase. T-08c plugs in without rewriting either.
+
+1. **`AuthoringLayout`** accepts a `context` child prop. T-08c passes the new `<ContextPane />` in place of the placeholder.
+2. **Query keys in `queries/authoring.ts`.** T-08c adds:
+   - `useCompleteness(specId)` — reads `['specs', specId, 'completeness']` (T-08b already invalidates on edit).
+   - `useUnresolved(specId)` — reads `['specs', specId, 'unresolved']`, a new query keyed off the new backend endpoint.
+   - `useRecentTurns(specId, limit)` — reads `['specs', specId, 'turns', { recent: limit }]` for the activity feed.
+   - `useRetryField(specId)` mutation — calls `POST /specs/:id/fields/retry` with `{ path }`. On success, invalidates `['specs', specId, 'unresolved']` and `['specs', specId, 'turns']`.
+   - `useMarkUnanswerable(specId)` mutation — calls `PATCH /specs/:id` with `{ path, value: { unknown: true, reason: "user marked as unanswerable" } }`. Already supported by T-08b's infrastructure; this is a convenience wrapper.
+3. **`AuthoringReadOnlyContext`.** T-08c consumes this. When read-only, Retry and Mark-unanswerable buttons don't render. Click-to-navigate to structured pane still works; the structured pane enforces its own read-only.
+4. **Active-target tracking.** T-08c reads it to highlight the current target field in the activity feed. No writes.
+
+---
+
+## Section 1: Overall completeness
+
+Top of the pane. The most visible element.
+
+- **Overall completeness score** — large display (e.g. `72%`) centred or left-aligned. Derived from `computeCompleteness(spec).overall`, rounded to nearest percent.
+- **Short label below the number** — "Complete" (≥ thresholds met per T-05), "In progress" (partial), "Just started" (< 15%).
+- **Six per-section bars** — one horizontal bar per section: `intent`, `domain_model`, `capabilities`, `flows`, `constraints`, `references`. Each shows section name on the left, a fill bar, percent on the right. Click a section bar → scrolls the structured pane to that section and expands it.
+
+Hide `provenance` and `extensions` from this breakdown — they're not part of the completeness contract.
+
+**Threshold visualisation.** From T-05's thresholds:
+- `intent` ≥ 0.95
+- `domain_model` ≥ 0.80
+- `capabilities` ≥ 0.80
+- `flows` ≥ 0.60
+- `constraints` ≥ 0.60
+- `references` ≥ 0.20
+
+Each section bar has a faint threshold marker (a thin vertical line) at the threshold percent. When the fill passes the marker, the bar turns a subtle "met" colour (a shade of green or accent, not saturated). Bars below threshold use neutral grey.
+
+This gives the user a visual sense of "how much more do I need in this section specifically" without surfacing the numeric thresholds directly.
+
+---
+
+## Section 2: Next action
+
+A single card immediately below the completeness block. States, in priority order:
+
+1. **If the conversation has hit the turn cap** (`turn_cap_reached` was the last `nextTurn` response):
+   - Card: "We've hit the conversation limit. Review the spec and address unresolved questions below."
+   - Primary link: "Review unresolved" (scrolls to section 3 within this pane).
+
+2. **If there are unresolved questions** (`useUnresolved` returns a non-empty list) **and** the spec is below its completeness thresholds:
+   - Card: "{N} unresolved question{s}. Resolving them will help the spec progress."
+   - Primary link: "Review unresolved" (scrolls to section 3).
+
+3. **If the spec has met all completeness thresholds**:
+   - Card: "Spec looks complete. Review, then export or send."
+   - Two secondary links: "Export JSON" (triggers the T-08a button) and "Send to RedDwarf" (only if the feature flag is on).
+
+4. **If there's an active selection waiting for a user answer** (latest turn is `phase: "selection"` with no corresponding `answer`):
+   - Card: "Answer the current question."
+   - Primary link: "Jump to conversation" (scrolls conversation pane to input; on mobile, switches to Conversation tab).
+
+5. **Default** (spec below threshold, no active selection, no cap hit):
+   - Card: "Continue the conversation to keep building the spec."
+   - Primary link: "Jump to conversation" (scrolls/switches tab).
+
+The card has a subtle accent border or background to distinguish it from surrounding sections, but is not loud. It's advisory, not a call to action.
+
+---
+
+## Section 3: Unresolved questions
+
+A list of fields that T-05 has given up on or the user has marked unanswerable. This is the recovery surface.
+
+### Data source
+
+New backend endpoint: `GET /specs/:id/unresolved` returning an array of:
+
+```ts
+type UnresolvedQuestion = {
+  path: string;                  // e.g. "capabilities[2].acceptance_criteria[0].given"
+  section: string;               // top-level section name
+  lastAskedAt: string;           // ISO timestamp
+  lastQuestion: string | null;   // the phrased question text, from the last selection turn
+  reason: "retry_budget_exhausted" | "user_marked_unanswerable";
+  retriesAttempted: number;      // 0 for user-marked, up to 3 for retry-budget
+};
+```
+
+Backend logic for this endpoint:
+- Query `conversation_turns` for this spec.
+- For each distinct `target_path`, find the most recent turn.
+- If the most recent turn is an answer with outcome `unparseable` and there are ≥ 3 `unparseable` turns in total for that path → include with reason `retry_budget_exhausted`.
+- If the field in the current spec is `{ unknown: true, reason: ... }` where reason contains "marked as unanswerable" (or some canonical marker T-08b establishes) → include with reason `user_marked_unanswerable`.
+- Exclude paths that have been successfully answered since the last problem turn — resolution clears them from the list.
+
+Sort by `lastAskedAt` descending.
+
+### Rendering
+
+Each entry as a compact card:
+- **Path** (e.g. `capabilities[2].acceptance_criteria[0].given`) — monospace, clickable, navigates to that field in the structured pane.
+- **Last question asked** (muted) — the phrased question text. If null (user marked unanswerable without ever being asked), show the section name instead.
+- **Status line** — "Couldn't parse after 3 tries" or "Marked as won't answer", with `lastAskedAt` as relative time.
+- **Actions** (right-aligned, only if not read-only):
+  - **Try again** — fires `useRetryField` mutation. Shows a spinner, then the entry either disappears (next conversation selection) or flags "Re-entered conversation" for a moment before disappearing.
+  - **Mark answered as unknown** — fires `useMarkUnanswerable` mutation. Writes `{ unknown: true, reason: "user marked as unanswerable" }` to the path. Entry updates to show the unanswerable state but remains visible for the session.
+
+### Empty state
+
+If no unresolved questions: "Nothing unresolved." Compact, muted. Do not hide the section entirely — its presence signals "this is where they'd appear."
+
+---
+
+## Section 4: Activity feed
+
+A compact reverse-chronological feed showing every turn, including `direct_edit` turns that don't appear in the conversation pane.
+
+### Data source
+
+Reuse the turns query from T-05 with a `?recent=50` param. Backend should already have this from T-05; if not, add the param.
+
+### Rendering
+
+Each entry: a single row (not a card), taking one or two lines:
+
+- **Icon or chip** indicating phase: `selection`, `answer`, `clarification`, `skip`, `unskip`, `direct_edit`.
+- **One-line summary** derived from phase:
+  - `selection`: "Asked about `<path>`"
+  - `answer`: "Answered `<path>`"
+  - `clarification`: "Needed clarification on `<path>`"
+  - `skip`: "Skipped `<path>`"
+  - `unskip`: "Unskipped `<path>`"
+  - `direct_edit`: "Edited `<path>` directly"
+- **Relative timestamp** on the right (e.g. "3m ago").
+
+Click a row → scrolls the structured pane to that field and expands the section.
+
+### Pagination / virtualisation
+
+If the list gets long (> 100 turns), pick one:
+- Virtualise with a standard library like `@tanstack/react-virtual`. Small bundle, already in the TanStack family.
+- Paginate with "Show more" at the bottom, loading 50 more per click.
+
+Virtualisation is nicer UX; paginate is simpler and adds nothing to the dependency list. Your call; flag the choice in the PR.
+
+### Highlight current target
+
+If `AuthoringContext.activeTargetPath` matches the `target_path` of a recent turn, highlight that row with a subtle accent background. Makes it easier to trace "what just happened" after an LLM turn completes.
+
+---
+
+## Read-only mode
+
+Consume `AuthoringReadOnlyContext`:
+- When read-only, hide all Retry and Mark-unanswerable buttons on unresolved questions.
+- Next-action card drops any "jump to conversation" links (since the conversation is disabled) and reads "Spec is read-only. You can still export or review unresolved questions."
+- Completeness bars remain clickable for navigation.
+- Activity feed rows remain clickable.
+
+---
+
+## Backend additions
+
+### New endpoint: `POST /specs/:id/fields/retry`
+
+Body: `{ "path": string }`. Path is a JSONPath-ish dotted string matching the `target_path` convention from T-05.
+
+Behaviour:
+- Auth: owner or editor-share.
+- 404 if the spec doesn't exist or the caller can't access it.
+- 400 if the path isn't currently in the unresolved set (prevents arbitrary re-ranking from the client).
+- On success: writes a `conversation_turns` row with `phase: "retry_request"` (new phase, add to the enum if constrained), target_path set, no LLM fields, outcome null. This row signals to T-05's selector that the retry budget for that path should be reset — T-05's selector logic needs a small update to read these rows and zero the count.
+- Returns 200 with `{ path, retryCleared: true }`.
+- Invalidates `['specs', specId, 'unresolved']` and `['specs', specId, 'turns']` for the caller's query cache (frontend handles this via mutation).
+
+### New endpoint: `GET /specs/:id/unresolved`
+
+See section 3 above for the response shape. Auth: owner or any share (read-only access is enough).
+
+### Extension to `GET /specs/:id/turns`
+
+Ensure it supports `?recent=N` and `?phases=phase1,phase2`. If T-05 didn't implement these, add them. Default limit 50, max 500.
+
+### T-05 selector update (small)
+
+T-05's `selectNextField` has a filter (step 4 in the original prompt) that drops candidates with ≥ 3 `unparseable` outcomes. Update this: a `retry_request` turn for a given path **resets the unparseable count to zero** from that point forward. The simplest implementation: only count unparseable turns that happened after the most recent `retry_request` for that path.
+
+This is a one-file change in `selector.ts`. Add a unit test for it.
+
+---
+
+## Pane layout
+
+```
+┌──────────────────────┐
+│                      │
+│    72%               │   ← Overall completeness
+│    In progress       │
+│                      │
+│  intent        ████  │   ← Section bars with threshold markers
+│  domain_model  ██    │
+│  capabilities  █     │
+│  flows         ▏     │
+│  constraints   ██    │
+│  references    █     │
+│                      │
+├──────────────────────┤
+│  Next action         │   ← Next-action card
+│  Answer the current  │
+│  question.           │
+│  → Jump to conv.     │
+├──────────────────────┤
+│  Unresolved (2)      │   ← Unresolved questions
+│  ┌────────────────┐  │
+│  │ capabilities…  │  │
+│  │ Couldn't parse │  │
+│  │ [Try again]    │  │
+│  └────────────────┘  │
+│  ┌────────────────┐  │
+│  │ flows[1].steps │  │
+│  │ Won't answer   │  │
+│  └────────────────┘  │
+├──────────────────────┤
+│  Activity            │   ← Activity feed
+│  ⬤ Asked about… 1m  │
+│  ⬤ Edited… 3m        │
+│  ⬤ Answered… 5m      │
+│  ...                 │
+└──────────────────────┘
+```
+
+Each section is visually distinct (light divider, slight padding variation) but not over-decorated. The pane is quiet by design.
+
+---
+
+## Component layout
+
+Files this ticket creates:
+
+```
+packages/frontend/src/components/authoring/
+├── ContextPane.tsx                       # replaces T-08a placeholder
+├── context/
+│   ├── CompletenessBlock.tsx
+│   ├── SectionBar.tsx                    # one row with threshold marker
+│   ├── NextActionCard.tsx
+│   ├── UnresolvedList.tsx
+│   ├── UnresolvedEntry.tsx
+│   ├── ActivityFeed.tsx
+│   └── ActivityRow.tsx
+```
+
+Backend files this ticket touches or creates:
+
+```
+packages/backend/src/
+├── migrations/
+│   └── 2026xxxxx_add_retry_request_phase.sql     # if constrained
+├── routes/
+│   ├── specs.fields.retry.ts                     # POST /specs/:id/fields/retry
+│   └── specs.unresolved.ts                       # GET /specs/:id/unresolved
+└── conversation/
+    └── selector.ts                               # update: reset count on retry_request
+```
+
+---
+
+## Tests
+
+Unit:
+- `NextActionCard` picks the correct state given each input permutation (turn cap, unresolved present, threshold met, active selection, default).
+- `SectionBar` renders the threshold marker at the correct percent position.
+- Activity feed one-line summary renders correctly per phase.
+- Unresolved entry shows the correct actions based on read-only state.
+
+Component:
+- Click on a section bar scrolls the structured pane and expands the section.
+- Click on an unresolved entry's path navigates correctly.
+- Click on an activity row navigates correctly.
+- Empty states render correctly (no unresolved, no activity).
+- Read-only mode hides Retry and Mark-unanswerable buttons.
+
+Integration (mocked API):
+- Full retry round-trip: entry in unresolved list, click Try again, mutation fires, list refetches, entry disappears.
+- Full mark-unanswerable round-trip: click Mark, PATCH fires, spec refetches, field shows unknown in structured pane (requires T-08b to already be working).
+
+Backend:
+- `POST /specs/:id/fields/retry` with a valid path resets the unparseable count.
+- With an invalid path (not in unresolved set) returns 400.
+- With a non-existent spec returns 404.
+- `GET /specs/:id/unresolved` returns correct entries for each reason type.
+- T-05's selector now treats paths with a recent `retry_request` as eligible again.
+
+---
+
+## Done when
+
+- The right pane replaces the T-08a placeholder.
+- Overall completeness renders correctly on realistic fixture specs.
+- All six section bars render with threshold markers and navigate on click.
+- Next-action card correctly picks its state across all five scenarios.
+- Unresolved questions list pulls from the new backend endpoint and renders correctly.
+- Retry action re-enters a stuck field into the conversation candidate set.
+- Mark-answered-as-unknown writes the correct spec value via the existing PATCH infrastructure.
+- Activity feed shows every turn including `direct_edit`, with correct phase icons and clickable navigation.
+- Read-only mode disables the right actions cleanly.
+- T-05's selector now resets the unparseable count after a `retry_request` turn.
+- You can sit down with a complete Context app — T-07, T-08a, T-08b, T-08c all live — and produce a realistic CRUD-app spec in ~45 minutes of conversation, with the right pane providing navigation and recovery throughout.
+- ESLint, Prettier, `tsc --noEmit`, and `pnpm test` all pass.
+
+---
+
+## Non-negotiables
+
+- Tailwind + shadcn only.
+- TanStack Query for every server interaction.
+- No new LLM calls in this ticket. The right pane is derived entirely from existing data.
+- Retry endpoint does not bypass T-05's selection logic — it resets the budget, then lets T-05 pick normally.
+- Mark-unanswerable routes through the existing PATCH infrastructure — no parallel write path.
+- Read-only state is respected everywhere.
+- TypeScript strict.
+- No RedDwarf code, no RedDwarf env vars.
+
+---
+
+## Out of scope
+
+Push back if asked to add any of these:
+
+- Charts, graphs, burn-down visualisations.
+- A spec "health score" beyond raw completeness (no quality metrics, no coverage scores).
+- Commenting or threaded discussion on unresolved questions.
+- Assigning unresolved questions to specific users.
+- Scheduled reminders or notifications for unresolved questions.
+- Bulk actions on activity feed (batch-revert edits, etc.).
+- Searchable activity feed — too much work for v0.1. If it's needed, it's a later ticket.
+- Turn-level diff view showing what changed. Linked path + field navigation is enough.
+- Export of activity feed as CSV/JSON.
+- Dark mode.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- Virtualise or paginate the activity feed. Pick based on dependency cost vs UX.
+- Exact visual treatment of the threshold marker on section bars (thin line, chevron, tick). Pick something restrained.
+- Whether the next-action card's priority order needs tweaking based on real-world use — the five-tier order specified here is a starting point.
+- Whether `retry_request` is a new phase in `conversation_turns` or reuses an existing phase with different semantics. New phase is cleaner; extending an existing phase is less migration work. Pick what fits T-05's actual enum shape.
+- Whether unresolved questions should also appear in the activity feed or be deliberately separate. I'd suggest separate — the activity feed is "what happened," unresolved is "what's stuck." Different mental models.
 
 ### T-09 — RedDwarf adapter package
 

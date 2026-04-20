@@ -51,6 +51,8 @@ function serializeTurn(row: ConversationTurn): Record<string, unknown> {
     llm_model_id: row.llmModelId,
     llm_tokens_in: row.llmTokensIn,
     llm_tokens_out: row.llmTokensOut,
+    question_text: row.questionText,
+    user_text: row.userText,
   }
 }
 
@@ -225,6 +227,7 @@ export const turnRoutes: FastifyPluginAsync<TurnRoutesOptions> = async (
           modelId: result.modelId,
           tokensIn: result.tokensIn,
           tokensOut: result.tokensOut,
+          questionText: result.text,
         })
         reply.send({
           text: result.text,
@@ -362,6 +365,7 @@ export const turnRoutes: FastifyPluginAsync<TurnRoutesOptions> = async (
           tokensIn: parseResult.tokensIn,
           tokensOut: parseResult.tokensOut,
           now: nowFn,
+          userText: body.data.user_text,
         })
         reply.send({
           kind: 'update',
@@ -384,6 +388,7 @@ export const turnRoutes: FastifyPluginAsync<TurnRoutesOptions> = async (
           tokensIn: parseResult.tokensIn,
           tokensOut: parseResult.tokensOut,
           now: nowFn,
+          userText: body.data.user_text,
         })
         reply.send({
           kind: 'clarification',
@@ -407,6 +412,7 @@ export const turnRoutes: FastifyPluginAsync<TurnRoutesOptions> = async (
           tokensIn: parseResult.tokensIn,
           tokensOut: parseResult.tokensOut,
           now: nowFn,
+          userText: body.data.user_text,
         })
         reply.send({
           kind: 'skip',
@@ -456,6 +462,7 @@ export const turnRoutes: FastifyPluginAsync<TurnRoutesOptions> = async (
         tokensIn: parseResult.tokensIn,
         tokensOut: parseResult.tokensOut,
         now: nowFn,
+          userText: body.data.user_text,
       })
       reply.send({
         kind: 'unknown',

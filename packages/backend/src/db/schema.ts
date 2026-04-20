@@ -97,6 +97,8 @@ export const conversationTurns = contextSchema.table(
     llmModelId: text('llm_model_id'),
     llmTokensIn: integer('llm_tokens_in'),
     llmTokensOut: integer('llm_tokens_out'),
+    questionText: text('question_text'),
+    userText: text('user_text'),
   },
   (t) => ({
     specTurnUnique: unique('conversation_turns_spec_turn_unique').on(t.specId, t.turnIndex),

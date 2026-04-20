@@ -138,16 +138,19 @@ export interface RecordPhraseInput {
   modelId: string
   tokensIn: number
   tokensOut: number
+  questionText?: string
 }
 
 export async function recordPhraseTokens(input: RecordPhraseInput): Promise<void> {
+  const patch: Partial<ConversationTurn> = {
+    llmModelId: input.modelId,
+    llmTokensIn: input.tokensIn,
+    llmTokensOut: input.tokensOut,
+  }
+  if (input.questionText !== undefined) patch.questionText = input.questionText
   await input.db.client
     .update(conversationTurns)
-    .set({
-      llmModelId: input.modelId,
-      llmTokensIn: input.tokensIn,
-      llmTokensOut: input.tokensOut,
-    })
+    .set(patch)
     .where(eq(conversationTurns.id, input.selectionTurnId))
 }
 
@@ -162,6 +165,7 @@ export interface RecordAnswerInput {
   modelId: string
   tokensIn: number
   tokensOut: number
+  userText?: string
   now?: () => Date
 }
 
@@ -198,6 +202,7 @@ export async function recordAnswerTurn(
       llmTokensIn: tokensIn,
       llmTokensOut: tokensOut,
       createdAt: nowFn(),
+      ...(input.userText !== undefined ? { userText: input.userText } : {}),
     })
     .returning()
 

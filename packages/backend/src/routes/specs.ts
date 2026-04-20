@@ -419,6 +419,68 @@ export const specRoutes: FastifyPluginAsync<SpecRoutesOptions> = async (
     })
   })
 
+  app.get('/specs/:id/lock', { preHandler: [app.requireAuth] }, async (req, reply) => {
+    const user = requireUserOr400(req, reply)
+    if (!user) return
+
+    const params = SpecIdParams.safeParse(req.params)
+    if (!params.success) {
+      reply.code(400).send({ error: 'invalid id' })
+      return
+    }
+
+    const result = await loadSpecWithAccess(db, params.data.id, user.id)
+    if (!result) {
+      reply.code(404).send({ error: 'not found' })
+      return
+    }
+
+    const row = result.spec
+    const now = nowFn()
+    const expired =
+      row.lockExpiresAt === null || row.lockExpiresAt.getTime() <= now.getTime()
+    const heldBy = expired ? null : row.lockedBy
+    const holder = await loadUser(db, heldBy)
+
+    reply.send({
+      spec_id: row.id,
+      locked_by: heldBy,
+      lock_expires_at: expired ? null : row.lockExpiresAt?.toISOString() ?? null,
+      held_by_caller: heldBy === user.id,
+      holder: holder ? { id: holder.id, name: holder.name } : null,
+    })
+  })
+
+  app.delete('/specs/:id/lock', { preHandler: [app.requireAuth] }, async (req, reply) => {
+    const user = requireUserOr400(req, reply)
+    if (!user) return
+
+    const params = SpecIdParams.safeParse(req.params)
+    if (!params.success) {
+      reply.code(400).send({ error: 'invalid id' })
+      return
+    }
+
+    const result = await loadSpecWithAccess(db, params.data.id, user.id)
+    if (!result) {
+      reply.code(404).send({ error: 'not found' })
+      return
+    }
+
+    const row = result.spec
+    if (row.lockedBy !== user.id) {
+      reply.code(409).send({ error: 'lock not held by caller' })
+      return
+    }
+
+    await db.client
+      .update(specs)
+      .set({ lockedBy: null, lockExpiresAt: null })
+      .where(eq(specs.id, row.id))
+
+    reply.code(204).send()
+  })
+
   app.post('/specs/:id/shares', { preHandler: [app.requireAuth] }, async (req, reply) => {
     const user = requireUserOr400(req, reply)
     if (!user) return
