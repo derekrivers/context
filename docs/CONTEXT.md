@@ -530,11 +530,300 @@ Flag these in the PR description so I can sanity-check:
 - Exact shape of `SelectionContext.surroundingSpec` — how much of the parent do you include? Default to the immediate parent object; if T-06 needs more, it can ask for it.
 - Whether skip/unskip endpoints live under `/turns/` or `/fields/`. I used `/turns/` above but `/fields/` might read better. Your call.
 
-### T-06 — LLM adapters: phrase + parse
+# T-06 — LLM Adapters: phrase + parse
 
-`phraseQuestion(targetField, specContext, conversationSoFar): string` — produces a natural question, no markdown, no lists. `parseAnswer(targetField, userText, specContext): FieldUpdate | ClarificationRequest` — returns a structured update or asks for clarification. Both honour `REDDWARF_MODEL_PROVIDER` and use the existing provider keys. If `parseAnswer` produces output that fails Zod, auto-re-prompt with a clarification and don't persist the invalid update. Record token usage and model ID on the conversation_turns row. Per-spec turn cap (`CONTEXT_MAX_TURNS_PER_SPEC`, default 60).
+You are implementing ticket **T-06** in the Context MVP build plan. This ticket introduces the two LLM-backed functions that sit on top of the T-05 state machine: one that phrases a question about a target field, and one that parses a user's free-text answer into a structured field update. The LLM does no planning — that's T-05's job. The LLM handles language only.
 
-**Done when:** you can sit through a full conversation end-to-end and the questions feel like something a thoughtful colleague would ask.
+This ticket depends on T-01 (schema), T-02 (DB), T-03 (auth), T-04 (spec CRUD), T-05 (state machine and turn recording). It does not depend on T-04a or anything later.
+
+---
+
+## Context — RedDwarf conventions
+
+Before writing any code, read these files from the RedDwarf repo:
+
+- `.env.example` — canonical env key order. `ANTHROPIC_API_KEY` is already present. Any new env var you add goes here first, in the existing `REDDWARF_*` style, with a comment.
+- `CLAUDE.md` and `AGENTS.md` in the repo root.
+- `packages/contracts` — domain schemas and types. Zod conventions.
+- `packages/control-plane` — existing orchestration patterns. Look for how Anthropic is called today for the planning agent. Reuse the same client wrapper if one exists; if there's only ad-hoc usage, this ticket will introduce the first proper wrapper.
+- `packages/evidence` — persistence patterns. Reuse the `pg.Pool` that's already configured via `REDDWARF_DB_POOL_*`.
+
+**Important correction to the original ticket wording.** The original T-06 referenced `REDDWARF_MODEL_PROVIDER`. That env var does not exist. RedDwarf is Anthropic-only in v1 — only `ANTHROPIC_API_KEY` is defined in `.env.example`. Do not introduce a provider abstraction layer in this ticket. Use the Anthropic SDK directly via a thin wrapper. If a provider layer is ever needed later, it's a separate refactor.
+
+---
+
+## Architectural split
+
+Two pure(ish) functions, one thin client module.
+
+### `@context/backend/src/llm/client.ts`
+
+A minimal wrapper around `@anthropic-ai/sdk`. Exposes a single `callModel({ system, messages, tools?, model, maxTokens }): Promise<ModelResponse>` function. Handles:
+
+- API key loading from `ANTHROPIC_API_KEY`.
+- Timeout (30 seconds default, from `CONTEXT_LLM_TIMEOUT_MS`).
+- Retries on 429 and 5xx: max 3 attempts, exponential backoff starting at 500ms.
+- Returns `{ content, tokensIn, tokensOut, modelId, stopReason }`. Do not leak SDK types beyond this module.
+
+No streaming in v0.1. The conversation UI is not realtime-dependent; wait for the full response.
+
+### `@context/backend/src/conversation/phrase.ts`
+
+```ts
+phraseQuestion(
+  selection: Selection,   // from T-05
+  turnsForSpec: TurnRecord[],
+): Promise<PhraseResult>
+```
+
+Returns `{ text, tokensIn, tokensOut, modelId }`. The `text` is a single sentence, no markdown, no bullet points, no preamble like "Great question!" The function itself enforces none of that — the system prompt does.
+
+### `@context/backend/src/conversation/parse.ts`
+
+```ts
+parseAnswer(
+  selection: Selection,
+  userText: string,
+  spec: CanonicalSpec,
+  turnsForSpec: TurnRecord[],
+): Promise<ParseResult>
+```
+
+Returns a discriminated union:
+
+```ts
+type ParseResult =
+  | { kind: "update"; updates: FieldUpdate[]; tokensIn: number; tokensOut: number; modelId: string }
+  | { kind: "clarification"; question: string; reason: ClarificationReason; tokensIn: number; tokensOut: number; modelId: string }
+  | { kind: "skip"; tokensIn: number; tokensOut: number; modelId: string }
+  | { kind: "unknown"; reason: string; tokensIn: number; tokensOut: number; modelId: string };
+
+type FieldUpdate = {
+  path: string;       // must be writable per the schema
+  value: unknown;     // must validate against the field's Zod schema
+  confidence: "high" | "medium" | "low";
+};
+
+type ClarificationReason =
+  | "ambiguous"
+  | "multiple_interpretations"
+  | "contradicts_existing_spec"
+  | "insufficient_detail";
+```
+
+Four outcomes, not two. The original "update or clarification" framing loses information:
+
+- **`update`** — parseable into one or more field updates.
+- **`clarification`** — the model needs more info to parse confidently. The returned `question` is phrased as a follow-up the UI can show directly.
+- **`skip`** — the user said "skip" / "not now" / "I'll come back to this." This is not an error, it's a first-class outcome. T-05 handles it via the skip endpoint.
+- **`unknown`** — the user said "I don't know" (or equivalent) and provided a reason. Writes the field as `{ unknown: true, reason: "..." }` per the T-01 schema.
+
+---
+
+## Structured output strategy
+
+Use **Anthropic tool use / function calling** for `parseAnswer`. Not JSON mode, not free-text-then-regex.
+
+- Define a tool called `record_answer` with four input variants matching the four `ParseResult` kinds. The model selects one.
+- For `update`, the tool's input schema includes the set of fields the model is allowed to write. Derive this at call time from `selection.targetField` plus any co-located fields in the same object (so the user answering "admins and customers" about a single `users` field can legitimately produce one update, but can't drift into writing `constraints.auth`).
+- On tool-use response, validate the tool input against Zod. If it fails, retry the call **once** with an appended `tool_result` block describing the validation failure. If the retry also fails, return `{ kind: "clarification", reason: "insufficient_detail", question: "<generated follow-up>" }`.
+- Never persist an invalid update. The `parseAnswer` function does not write to the database at all; it returns a structured result, and T-08's answer-handling code writes on success.
+
+For `phraseQuestion`, no tool use — it's a free-text call. The system prompt enforces constraints (single sentence, no markdown, conversational, colleague tone).
+
+---
+
+## Models
+
+Two models, two env vars:
+
+- `CONTEXT_PHRASE_MODEL` (default: `claude-haiku-4-5-20251001`) — phrase calls are cheap, high-volume, conversational. Haiku is plenty.
+- `CONTEXT_PARSE_MODEL` (default: `claude-sonnet-4-6`) — parse calls are where reliability matters. A user typing "yeah just admins for now" needs to become `{ path: "intent.users", value: ["admin"], confidence: "medium" }` without drama. Use a stronger model.
+
+Both values come from env, validated at startup, fail loudly if absent or malformed.
+
+Add to `.env.example` (in canonical order, with comments):
+
+```
+# -- Context LLM configuration -------------------------------------------------
+CONTEXT_PHRASE_MODEL=claude-haiku-4-5-20251001
+CONTEXT_PARSE_MODEL=claude-sonnet-4-6
+CONTEXT_LLM_TIMEOUT_MS=30000
+CONTEXT_MAX_TURNS_PER_SPEC=60
+CONTEXT_MAX_TOKENS_PER_SPEC=500000
+```
+
+---
+
+## System prompts
+
+Both prompts live in `@context/backend/src/conversation/prompts/` as `.md` files and are loaded at startup. Don't inline long prompts into TypeScript — they'll be iterated on, and diffs are easier to read as markdown.
+
+### `phrase.md` — tone guidance
+
+Write it to produce questions that feel like a thoughtful colleague is asking, not a form. Key constraints to include:
+
+- One sentence. Occasionally two if the field genuinely needs setup context.
+- No markdown, no bullet lists, no numbered lists, no bold, no headers.
+- No preamble ("Great question!", "Sure thing!", "Let me ask about...").
+- No meta-commentary ("Now I need to understand...", "The next thing to figure out...").
+- Reference the existing spec naturally when it helps — "You mentioned the app is for small clinics — roughly how many users per clinic?" — rather than asking in a vacuum.
+- Don't ask compound questions. One field, one question.
+- Tone: curious, concise, respectful of the user's time. Think "senior engineer interviewing a PM," not "chatbot."
+
+Include 3–5 good/bad pairs in the prompt as few-shot examples. I'll draft those in a follow-up if you want — for v0.1, start with examples drawn from a CRUD-app spec: asking about entity fields, acceptance criteria, non-goals.
+
+### `parse.md` — extraction guidance
+
+Key constraints:
+
+- The `record_answer` tool must be called. No free-text replies.
+- Preserve ambiguity. If the user said "a few admins and some customers," the confidence is `medium`, not `high`. Don't round up.
+- Detect skip intent broadly — "skip", "not now", "later", "no idea, move on" — and map to `{ kind: "skip" }`.
+- Detect unknown intent — "I don't know", "not sure yet", "TBD" — and map to `{ kind: "unknown" }` with a reason. If the user provides no reason, ask for one via `clarification`.
+- When the user answers multiple adjacent fields in one turn, produce multiple updates. Scope is limited to fields within the same parent object as `selection.targetField`.
+- If the user's answer contradicts something already in the spec (e.g., previously said "single-tenant," now says "multi-tenant"), return `{ kind: "clarification", reason: "contradicts_existing_spec" }` and surface the conflict in the follow-up question. Do not silently overwrite.
+
+---
+
+## Conversation history shape
+
+`turnsForSpec` is the full ordered list of turns for the spec. Do not send all of them to the LLM on every call — that blows token budgets fast.
+
+For `phraseQuestion`:
+
+- Include the last 6 turns verbatim (selection + answer pairs) as conversation context.
+- Include a compact summary of the current spec state: which sections have content, which don't. Not the full spec JSON.
+- Target total context for a phrase call: under 2000 tokens input.
+
+For `parseAnswer`:
+
+- Include the last 3 turns verbatim.
+- Include the **full current spec JSON**, because the model needs to detect contradictions and scope multi-field updates correctly.
+- Include the field's Zod schema (converted to JSON schema) as part of the tool definition.
+- Target total context for a parse call: under 8000 tokens input.
+
+These are soft budgets. If a genuinely huge spec blows through them, log a warning and proceed — do not truncate the spec itself, because the parser needs it.
+
+---
+
+## Turn recording integration with T-05
+
+T-05 defined `context.conversation_turns` with `llm_model_id`, `llm_tokens_in`, `llm_tokens_out` columns and phases `selection` / `answer` / `clarification` / `skip` / `unskip`.
+
+This ticket adds the persistence logic for `answer` and `clarification` phases:
+
+- When `parseAnswer` returns `kind: "update"`, the HTTP handler (see below) inserts an `answer` turn with outcome `answered`, back-fills the outcome on the matching `selection` turn, and applies the updates via `PATCH /specs/:id` (the existing T-04 endpoint, called internally).
+- When it returns `kind: "clarification"`, insert a `clarification` turn with outcome `clarification_requested`, back-fill the matching selection turn.
+- When it returns `kind: "skip"`, insert a `skip` turn with outcome `skipped`, back-fill the matching selection turn.
+- When it returns `kind: "unknown"`, insert an `answer` turn with outcome `answered`, and write `{ unknown: true, reason }` to the field.
+
+Every turn records `llm_model_id`, `llm_tokens_in`, `llm_tokens_out`. Both phrase and parse calls contribute these numbers — if a turn involved both (selection → phrase → user answer → parse), record the parse call's numbers on the answer turn and the phrase call's numbers on the selection turn.
+
+---
+
+## Limits and circuit breakers
+
+### Turn cap
+
+`CONTEXT_MAX_TURNS_PER_SPEC` (default 60). When `nextTurn` is called and the spec already has ≥ this many turns, return `null` with a distinct `SelectionReason` variant (add `{ kind: "turn_cap_reached" }` to the T-05 type). The UI surfaces this as "We've talked for a while — review what we have, then decide if there's more to add."
+
+### Token cap
+
+`CONTEXT_MAX_TOKENS_PER_SPEC` (default 500000). Sum `llm_tokens_in + llm_tokens_out` across all turns for the spec. When this is hit, the `nextTurn` endpoint returns the same `turn_cap_reached` signal. Log a warning with the final totals.
+
+Both caps are defensive. A well-behaved spec closes in 25–50 turns and well under 200k total tokens.
+
+### Timeout behaviour
+
+If the LLM call times out, return a structured error to the HTTP caller (502 or 504). Do not persist a turn with zero tokens — that would poison the token counter. Log the failure with the selection id so it's diagnosable.
+
+### Rate limit behaviour
+
+The client wrapper handles 429s with backoff. If all retries exhaust, return 429 to the HTTP caller. Do not record a turn on exhaustion either.
+
+---
+
+## HTTP surface
+
+Add to `@context/backend`:
+
+- `POST /specs/:id/turns/answer` — body: `{ turnId: string, userText: string }`. Calls `parseAnswer`, records turns, applies updates if applicable, returns the `ParseResult` to the caller so the UI can react.
+- `POST /specs/:id/turns/phrase` — internal; called by the HTTP handler after `nextTurn` to produce the question text. Could be folded into the `POST /specs/:id/turns/next` response from T-05 — your choice. If folded, note it clearly in the PR description.
+
+Auth: caller must be owner or have an `editor` share (T-04a).
+
+---
+
+## Tests
+
+Unit tests for pure bits:
+
+- `buildPhraseContext(turnsForSpec, spec)` returns the expected compact summary.
+- `buildParseToolSchema(selection, spec)` produces a Zod-to-JSON-schema object that validates sample inputs correctly.
+- `interpretToolUse(toolCall, schema)` maps each of the four tool-call shapes to the correct `ParseResult` kind.
+
+Integration tests with the Anthropic client mocked:
+
+- `phraseQuestion` returns plain text with no markdown (post-hoc assertion; if it starts drifting, that signals a prompt problem).
+- `parseAnswer` with a clean "users are admins and customers" input returns a high/medium-confidence update.
+- `parseAnswer` with "skip this" returns `kind: "skip"`.
+- `parseAnswer` with "not sure, probably later" returns `kind: "unknown"` (or `clarification` if no reason).
+- `parseAnswer` with a contradiction returns `kind: "clarification"` with `reason: "contradicts_existing_spec"`.
+- Zod validation failure on tool input triggers exactly one retry, then returns clarification.
+
+Live tests (behind a `pnpm test:live` script, not in default `pnpm test`):
+
+- Walk a fixture spec through 10 turns end-to-end against the real API. Assert total tokens stay under a sane ceiling. This is your canary for prompt drift across model updates.
+
+---
+
+## Done when
+
+- You can sit through a full conversation end-to-end (spec creation → threshold met → JSON export) and the questions feel like a thoughtful colleague asked them.
+- Conversations on a realistic CRUD-app fixture close in 25–50 turns and under 200k total tokens.
+- `parseAnswer` handles "skip", "unknown", contradiction, and multi-field answers correctly in manual testing.
+- Invalid tool outputs never persist. Verified by forcing a Zod-violating response in tests.
+- Every turn row has non-null `llm_model_id`, `llm_tokens_in`, `llm_tokens_out`.
+- Turn cap and token cap fire cleanly and surface in the UI as a distinct terminal state.
+
+---
+
+## Non-negotiables
+
+- No provider abstraction. Anthropic SDK directly. A provider layer is a future refactor, not this ticket.
+- System prompts live in markdown files, not inlined in TypeScript.
+- `parseAnswer` is the only code path that writes field updates during a conversation. Direct spec edits via T-08's structured pane go through `PATCH /specs/:id` and bypass parsing entirely — those paths stay separate.
+- Every LLM call records tokens and model id against a turn row. No exceptions.
+- TypeScript strict. Zod-validate every HTTP body and every tool-use input.
+- `.env.example` updated in canonical order with comments.
+- No streaming in v0.1.
+
+---
+
+## Out of scope
+
+Push back if asked to add any of these:
+
+- Streaming responses.
+- Multi-provider support (OpenAI, local models, etc.).
+- A "conversation memory" concept separate from the turn log.
+- Model-driven selection of the next field (that's T-05's job, and the whole point is it's deterministic).
+- Automatic spec summarisation or compression.
+- Persona-aware prompting (different tone per user).
+- Translation or multilingual support.
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- Whether to fold `phrase` into the `POST /specs/:id/turns/next` response or keep it a separate call. Separate is cleaner architecturally; folded is one fewer round-trip for the UI.
+- Exact few-shot examples in `phrase.md` — generate 3–5 drawn from realistic CRUD-app contexts.
+- Whether `confidence: "low"` updates should auto-trigger a confirmation turn in the UI, or just flag the field visually in T-08. My instinct is the latter; this ticket just returns the confidence.
+- Whether the live test script runs against Haiku-only to save tokens, or exercises both models.
+
 
 ### T-07 — React SPA scaffold + spec list
 

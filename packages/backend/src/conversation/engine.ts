@@ -14,13 +14,15 @@ export class SpecNotFoundError extends Error {
 
 export interface NextTurnOptions {
   now?: () => Date
+  maxTurnsPerSpec?: number
+  maxTokensPerSpec?: number
 }
 
-export interface NextTurnResult {
-  turnId: string
-  turnIndex: number
-  selection: Selection
-}
+export type NextTurnOutcome =
+  | { kind: 'selection'; turnId: string; turnIndex: number; selection: Selection }
+  | { kind: 'turn_cap_reached'; turnCount: number; limit: number }
+  | { kind: 'token_cap_reached'; tokenCount: number; limit: number }
+  | { kind: 'complete' }
 
 function toSelectorTurn(row: ConversationTurn): SelectorTurn {
   return {
@@ -53,18 +55,46 @@ export async function loadTurns(db: Db, specId: string): Promise<ConversationTur
     .orderBy(asc(conversationTurns.turnIndex))
 }
 
+function sumTokens(rows: ConversationTurn[]): number {
+  let total = 0
+  for (const r of rows) {
+    total += r.llmTokensIn ?? 0
+    total += r.llmTokensOut ?? 0
+  }
+  return total
+}
+
 export async function nextTurn(
   db: Db,
   specId: string,
   options: NextTurnOptions = {},
-): Promise<NextTurnResult | null> {
+): Promise<NextTurnOutcome> {
   const nowFn = options.now ?? (() => new Date())
   const spec = await loadSpec(db, specId)
   const turnRows = await loadTurns(db, specId)
+
+  if (options.maxTurnsPerSpec !== undefined && turnRows.length >= options.maxTurnsPerSpec) {
+    return {
+      kind: 'turn_cap_reached',
+      turnCount: turnRows.length,
+      limit: options.maxTurnsPerSpec,
+    }
+  }
+  if (options.maxTokensPerSpec !== undefined) {
+    const total = sumTokens(turnRows)
+    if (total >= options.maxTokensPerSpec) {
+      return {
+        kind: 'token_cap_reached',
+        tokenCount: total,
+        limit: options.maxTokensPerSpec,
+      }
+    }
+  }
+
   const turns = turnRows.map(toSelectorTurn)
 
   const selection = selectNextField(spec, turns)
-  if (selection === null) return null
+  if (selection === null) return { kind: 'complete' }
 
   const report = computeCompleteness(spec)
   const bySection: Record<string, number> = {}
@@ -95,10 +125,88 @@ export async function nextTurn(
   if (!row) throw new Error('conversation_turns insert returned no row')
 
   return {
+    kind: 'selection',
     turnId: row.id,
     turnIndex: row.turnIndex,
     selection,
   }
+}
+
+export interface RecordPhraseInput {
+  db: Db
+  selectionTurnId: string
+  modelId: string
+  tokensIn: number
+  tokensOut: number
+}
+
+export async function recordPhraseTokens(input: RecordPhraseInput): Promise<void> {
+  await input.db.client
+    .update(conversationTurns)
+    .set({
+      llmModelId: input.modelId,
+      llmTokensIn: input.tokensIn,
+      llmTokensOut: input.tokensOut,
+    })
+    .where(eq(conversationTurns.id, input.selectionTurnId))
+}
+
+export type AnswerOutcome = 'answered' | 'clarification_requested' | 'skipped'
+
+export interface RecordAnswerInput {
+  db: Db
+  specId: string
+  selectionTurnId: string
+  phase: 'answer' | 'clarification' | 'skip'
+  outcome: AnswerOutcome
+  modelId: string
+  tokensIn: number
+  tokensOut: number
+  now?: () => Date
+}
+
+export async function recordAnswerTurn(
+  input: RecordAnswerInput,
+): Promise<ConversationTurn | null> {
+  const { db, specId, selectionTurnId, phase, outcome, modelId, tokensIn, tokensOut } =
+    input
+  const nowFn = input.now ?? (() => new Date())
+
+  const selRows = await db.client
+    .select()
+    .from(conversationTurns)
+    .where(eq(conversationTurns.id, selectionTurnId))
+    .limit(1)
+  const selection = selRows[0]
+  if (!selection || selection.specId !== specId) return null
+  if (selection.phase !== 'selection') return null
+
+  const turnRows = await loadTurns(db, specId)
+  const nextIndex =
+    turnRows.length === 0 ? 0 : turnRows[turnRows.length - 1]!.turnIndex + 1
+
+  const inserted = await db.client
+    .insert(conversationTurns)
+    .values({
+      specId,
+      turnIndex: nextIndex,
+      phase,
+      targetPath: selection.targetPath,
+      targetSection: selection.targetSection,
+      outcome,
+      llmModelId: modelId,
+      llmTokensIn: tokensIn,
+      llmTokensOut: tokensOut,
+      createdAt: nowFn(),
+    })
+    .returning()
+
+  await db.client
+    .update(conversationTurns)
+    .set({ outcome })
+    .where(eq(conversationTurns.id, selectionTurnId))
+
+  return inserted[0] ?? null
 }
 
 export interface RecordSkipInput {

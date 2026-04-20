@@ -24,6 +24,12 @@ const ConfigSchema = z.object({
   CONTEXT_ADMIN_TOKEN: z
     .string()
     .min(16, 'CONTEXT_ADMIN_TOKEN must be at least 16 characters'),
+  ANTHROPIC_API_KEY: z.string().min(1, 'ANTHROPIC_API_KEY is required'),
+  CONTEXT_PHRASE_MODEL: z.string().min(1).default('claude-haiku-4-5-20251001'),
+  CONTEXT_PARSE_MODEL: z.string().min(1).default('claude-sonnet-4-6'),
+  CONTEXT_LLM_TIMEOUT_MS: PositiveInt.default(30000),
+  CONTEXT_MAX_TURNS_PER_SPEC: PositiveInt.default(60),
+  CONTEXT_MAX_TOKENS_PER_SPEC: PositiveInt.default(500000),
 })
 
 export type AppConfig = {
@@ -41,6 +47,12 @@ export type AppConfig = {
     poolMax: number
   }
   adminToken: string
+  anthropicApiKey: string
+  phraseModel: string
+  parseModel: string
+  llmTimeoutMs: number
+  maxTurnsPerSpec: number
+  maxTokensPerSpec: number
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -65,5 +77,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       poolMax: v.CONTEXT_PG_POOL_MAX,
     },
     adminToken: v.CONTEXT_ADMIN_TOKEN,
+    anthropicApiKey: v.ANTHROPIC_API_KEY,
+    phraseModel: v.CONTEXT_PHRASE_MODEL,
+    parseModel: v.CONTEXT_PARSE_MODEL,
+    llmTimeoutMs: v.CONTEXT_LLM_TIMEOUT_MS,
+    maxTurnsPerSpec: v.CONTEXT_MAX_TURNS_PER_SPEC,
+    maxTokensPerSpec: v.CONTEXT_MAX_TOKENS_PER_SPEC,
   }
 }

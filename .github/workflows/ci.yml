@@ -39,6 +39,7 @@ jobs:
       CONTEXT_PG_DATABASE: context
       CONTEXT_PG_SSL: "false"
       CONTEXT_ADMIN_TOKEN: ci-admin-token-0123456789abcdef
+      ANTHROPIC_API_KEY: ci-placeholder-not-a-real-key
 
     steps:
       - uses: actions/checkout@v4
