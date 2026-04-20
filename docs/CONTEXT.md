@@ -530,7 +530,7 @@ Flag these in the PR description so I can sanity-check:
 - Exact shape of `SelectionContext.surroundingSpec` — how much of the parent do you include? Default to the immediate parent object; if T-06 needs more, it can ask for it.
 - Whether skip/unskip endpoints live under `/turns/` or `/fields/`. I used `/turns/` above but `/fields/` might read better. Your call.
 
-# T-06 — LLM Adapters: phrase + parse
+# T-06 — LLM Adapters: phrase + parse (Revised)
 
 You are implementing ticket **T-06** in the Context MVP build plan. This ticket introduces the two LLM-backed functions that sit on top of the T-05 state machine: one that phrases a question about a target field, and one that parses a user's free-text answer into a structured field update. The LLM does no planning — that's T-05's job. The LLM handles language only.
 
@@ -538,36 +538,66 @@ This ticket depends on T-01 (schema), T-02 (DB), T-03 (auth), T-04 (spec CRUD), 
 
 ---
 
-## Context — RedDwarf conventions
+## ⚠️ Remediation first — an earlier draft of this ticket was wrong
 
-Before writing any code, read these files from the RedDwarf repo:
+An earlier version of this ticket was drafted under the assumption that Context lives inside the RedDwarf monorepo. **It does not.** Context is a standalone repo at `github.com/derekrivers/context`. RedDwarf is a downstream consumer of Context's exported specs (via T-09 and T-10) and has no shared code with Context.
 
-- `.env.example` — canonical env key order. `ANTHROPIC_API_KEY` is already present. Any new env var you add goes here first, in the existing `REDDWARF_*` style, with a comment.
-- `CLAUDE.md` and `AGENTS.md` in the repo root.
-- `packages/contracts` — domain schemas and types. Zod conventions.
-- `packages/control-plane` — existing orchestration patterns. Look for how Anthropic is called today for the planning agent. Reuse the same client wrapper if one exists; if there's only ad-hoc usage, this ticket will introduce the first proper wrapper.
-- `packages/evidence` — persistence patterns. Reuse the `pg.Pool` that's already configured via `REDDWARF_DB_POOL_*`.
+As a result, code that was already written for T-06 likely contains references to RedDwarf packages that do not exist in the Context repo. **Before writing any new T-06 code, find and remove those references.** Rebuild on clean foundations rather than patching over broken imports.
 
-**Important correction to the original ticket wording.** The original T-06 referenced `REDDWARF_MODEL_PROVIDER`. That env var does not exist. RedDwarf is Anthropic-only in v1 — only `ANTHROPIC_API_KEY` is defined in `.env.example`. Do not introduce a provider abstraction layer in this ticket. Use the Anthropic SDK directly via a thin wrapper. If a provider layer is ever needed later, it's a separate refactor.
+### Likely damage to find and fix
+
+Search the Context repo for any of the following and treat each hit as a bug:
+
+- Imports from `@reddwarf/*` or relative paths pointing into `packages/control-plane`, `packages/evidence`, `packages/contracts`, `packages/policy`, `packages/execution-plane`, `packages/integrations`. None of these exist in Context.
+- References to `REDDWARF_MODEL_PROVIDER`, `REDDWARF_MODEL_*`, or any assumption that Context reuses a RedDwarf LLM client. **No such client exists in Context.** T-06 is where Context's LLM client is built for the first time.
+- Imports of a RedDwarf pg pool or config helper. Context has its own pool from T-02 (configured via `CONTEXT_DB_POOL_*` env vars, not `REDDWARF_DB_POOL_*`).
+- Env var reads for `ANTHROPIC_API_KEY` that assume it was loaded by RedDwarf's bootstrap. Context loads its own env in T-02's server bootstrap.
+- Comments or doc strings that reference "the existing RedDwarf planning agent's LLM call pattern" or similar. There is no such pattern in Context to reuse.
+
+### Remediation procedure
+
+1. Grep the Context repo for the patterns above. List every hit in the PR description.
+2. Delete or rewrite each one. Do not leave stubs, do not leave TODO comments. If a file was created solely to bridge to a RedDwarf package, delete the whole file.
+3. Check git history for any migration files or `.env.example` edits that reference `REDDWARF_*` variables. Remove them. If a migration already ran against a dev DB, write a follow-on migration to drop any columns or tables that were created based on the wrong assumption.
+4. Run `pnpm typecheck` and `pnpm test` across the repo. Nothing should compile against RedDwarf packages because those packages are not in Context's dependency graph. The errors you see are the ones to fix.
+5. Only once the repo compiles and tests pass on a clean baseline, proceed with the T-06 implementation below.
+
+If remediation reveals that T-05's turn-recording logic was also coupled to RedDwarf assumptions, stop and flag that before continuing. T-06 cannot be built correctly on top of a broken T-05.
+
+---
+
+## Context — Context repo conventions
+
+Read these from the Context repo before starting:
+
+- `.env.example` at the repo root — canonical env key order. Any new env var goes here in the existing `CONTEXT_*` style with a comment. **Do not reuse `REDDWARF_*` env var names.**
+- Root `tsconfig.base.json`, `eslint.config.js`, `.prettierrc.json`, `vitest.config.ts` — reuse whatever T-01 through T-05 established.
+- `packages/backend/` — this is where the T-06 code lives. Follow the structure T-02 and T-05 established for routes, db access, and logging.
+- `packages/spec-schema/` — source of truth for the spec Zod schema. T-06 converts parts of it to JSON schema for tool-use definitions.
+- `CLAUDE.md` / `AGENTS.md` at the repo root, if present.
+
+No RedDwarf files are relevant to T-06. Do not read them. Do not reference them.
 
 ---
 
 ## Architectural split
 
-Two pure(ish) functions, one thin client module.
+Two pure(ish) functions, one thin client module. All three live in `packages/backend/`.
 
-### `@context/backend/src/llm/client.ts`
+### `packages/backend/src/llm/client.ts`
 
 A minimal wrapper around `@anthropic-ai/sdk`. Exposes a single `callModel({ system, messages, tools?, model, maxTokens }): Promise<ModelResponse>` function. Handles:
 
-- API key loading from `ANTHROPIC_API_KEY`.
+- API key loading from `ANTHROPIC_API_KEY` (Context loads this at backend startup — if not already loaded by T-02's bootstrap, add it there as part of this ticket).
 - Timeout (30 seconds default, from `CONTEXT_LLM_TIMEOUT_MS`).
 - Retries on 429 and 5xx: max 3 attempts, exponential backoff starting at 500ms.
 - Returns `{ content, tokensIn, tokensOut, modelId, stopReason }`. Do not leak SDK types beyond this module.
 
 No streaming in v0.1. The conversation UI is not realtime-dependent; wait for the full response.
 
-### `@context/backend/src/conversation/phrase.ts`
+This is the **first and only** LLM client in Context. Do not look for an existing one to reuse — there isn't one. Do not build an abstraction over multiple providers. Anthropic only.
+
+### `packages/backend/src/conversation/phrase.ts`
 
 ```ts
 phraseQuestion(
@@ -578,7 +608,7 @@ phraseQuestion(
 
 Returns `{ text, tokensIn, tokensOut, modelId }`. The `text` is a single sentence, no markdown, no bullet points, no preamble like "Great question!" The function itself enforces none of that — the system prompt does.
 
-### `@context/backend/src/conversation/parse.ts`
+### `packages/backend/src/conversation/parse.ts`
 
 ```ts
 parseAnswer(
@@ -611,7 +641,7 @@ type ClarificationReason =
   | "insufficient_detail";
 ```
 
-Four outcomes, not two. The original "update or clarification" framing loses information:
+Four outcomes, not two. The original ticket said "update or clarification" — that loses information:
 
 - **`update`** — parseable into one or more field updates.
 - **`clarification`** — the model needs more info to parse confidently. The returned `question` is phrased as a follow-up the UI can show directly.
@@ -642,10 +672,11 @@ Two models, two env vars:
 
 Both values come from env, validated at startup, fail loudly if absent or malformed.
 
-Add to `.env.example` (in canonical order, with comments):
+Add to Context's root `.env.example` (in canonical order, with comments):
 
 ```
 # -- Context LLM configuration -------------------------------------------------
+ANTHROPIC_API_KEY=sk-ant-your_key_here
 CONTEXT_PHRASE_MODEL=claude-haiku-4-5-20251001
 CONTEXT_PARSE_MODEL=claude-sonnet-4-6
 CONTEXT_LLM_TIMEOUT_MS=30000
@@ -653,11 +684,13 @@ CONTEXT_MAX_TURNS_PER_SPEC=60
 CONTEXT_MAX_TOKENS_PER_SPEC=500000
 ```
 
+If `ANTHROPIC_API_KEY` is already in `.env.example` from an earlier ticket, don't duplicate it — just ensure it's present.
+
 ---
 
 ## System prompts
 
-Both prompts live in `@context/backend/src/conversation/prompts/` as `.md` files and are loaded at startup. Don't inline long prompts into TypeScript — they'll be iterated on, and diffs are easier to read as markdown.
+Both prompts live in `packages/backend/src/conversation/prompts/` as `.md` files and are loaded at startup. Don't inline long prompts into TypeScript — they'll be iterated on, and diffs are easier to read as markdown.
 
 ### `phrase.md` — tone guidance
 
@@ -671,7 +704,7 @@ Write it to produce questions that feel like a thoughtful colleague is asking, n
 - Don't ask compound questions. One field, one question.
 - Tone: curious, concise, respectful of the user's time. Think "senior engineer interviewing a PM," not "chatbot."
 
-Include 3–5 good/bad pairs in the prompt as few-shot examples. I'll draft those in a follow-up if you want — for v0.1, start with examples drawn from a CRUD-app spec: asking about entity fields, acceptance criteria, non-goals.
+Include 3–5 good/bad pairs in the prompt as few-shot examples. Draw them from realistic CRUD-app spec contexts: asking about entity fields, acceptance criteria, non-goals.
 
 ### `parse.md` — extraction guidance
 
@@ -713,12 +746,14 @@ T-05 defined `context.conversation_turns` with `llm_model_id`, `llm_tokens_in`, 
 
 This ticket adds the persistence logic for `answer` and `clarification` phases:
 
-- When `parseAnswer` returns `kind: "update"`, the HTTP handler (see below) inserts an `answer` turn with outcome `answered`, back-fills the outcome on the matching `selection` turn, and applies the updates via `PATCH /specs/:id` (the existing T-04 endpoint, called internally).
+- When `parseAnswer` returns `kind: "update"`, the HTTP handler inserts an `answer` turn with outcome `answered`, back-fills the outcome on the matching `selection` turn, and applies the updates via `PATCH /specs/:id` (the existing T-04 endpoint, called internally).
 - When it returns `kind: "clarification"`, insert a `clarification` turn with outcome `clarification_requested`, back-fill the matching selection turn.
 - When it returns `kind: "skip"`, insert a `skip` turn with outcome `skipped`, back-fill the matching selection turn.
 - When it returns `kind: "unknown"`, insert an `answer` turn with outcome `answered`, and write `{ unknown: true, reason }` to the field.
 
 Every turn records `llm_model_id`, `llm_tokens_in`, `llm_tokens_out`. Both phrase and parse calls contribute these numbers — if a turn involved both (selection → phrase → user answer → parse), record the parse call's numbers on the answer turn and the phrase call's numbers on the selection turn.
+
+**Important:** if your remediation in the section above revealed that turn-recording columns were named or typed based on RedDwarf conventions (`reddwarf_tokens_in`, etc.), correct them before implementing this section. The column names are `llm_model_id`, `llm_tokens_in`, `llm_tokens_out` — nothing RedDwarf-prefixed.
 
 ---
 
@@ -746,7 +781,7 @@ The client wrapper handles 429s with backoff. If all retries exhaust, return 429
 
 ## HTTP surface
 
-Add to `@context/backend`:
+Add to `packages/backend/src/routes/`:
 
 - `POST /specs/:id/turns/answer` — body: `{ turnId: string, userText: string }`. Calls `parseAnswer`, records turns, applies updates if applicable, returns the `ParseResult` to the caller so the UI can react.
 - `POST /specs/:id/turns/phrase` — internal; called by the HTTP handler after `nextTurn` to produce the question text. Could be folded into the `POST /specs/:id/turns/next` response from T-05 — your choice. If folded, note it clearly in the PR description.
@@ -780,6 +815,7 @@ Live tests (behind a `pnpm test:live` script, not in default `pnpm test`):
 
 ## Done when
 
+- Remediation section above is complete. Repo compiles, tests pass, no references to RedDwarf packages remain.
 - You can sit through a full conversation end-to-end (spec creation → threshold met → JSON export) and the questions feel like a thoughtful colleague asked them.
 - Conversations on a realistic CRUD-app fixture close in 25–50 turns and under 200k total tokens.
 - `parseAnswer` handles "skip", "unknown", contradiction, and multi-field answers correctly in manual testing.
@@ -791,12 +827,13 @@ Live tests (behind a `pnpm test:live` script, not in default `pnpm test`):
 
 ## Non-negotiables
 
+- No RedDwarf code, no RedDwarf packages, no RedDwarf env vars. Context is standalone.
 - No provider abstraction. Anthropic SDK directly. A provider layer is a future refactor, not this ticket.
 - System prompts live in markdown files, not inlined in TypeScript.
 - `parseAnswer` is the only code path that writes field updates during a conversation. Direct spec edits via T-08's structured pane go through `PATCH /specs/:id` and bypass parsing entirely — those paths stay separate.
 - Every LLM call records tokens and model id against a turn row. No exceptions.
 - TypeScript strict. Zod-validate every HTTP body and every tool-use input.
-- `.env.example` updated in canonical order with comments.
+- `.env.example` updated in canonical order with comments. `CONTEXT_*` prefix only.
 - No streaming in v0.1.
 
 ---
@@ -812,6 +849,7 @@ Push back if asked to add any of these:
 - Automatic spec summarisation or compression.
 - Persona-aware prompting (different tone per user).
 - Translation or multilingual support.
+- Any direct integration with RedDwarf. Context exports specs as JSON; RedDwarf consumes them separately via T-09 and T-10.
 
 ---
 
@@ -825,11 +863,309 @@ Flag these in the PR description:
 - Whether the live test script runs against Haiku-only to save tokens, or exercises both models.
 
 
-### T-07 — React SPA scaffold + spec list
 
-Create `@context/frontend` as a Vite React app. Same styling and component patterns as `packages/dashboard`. Port 5174. Token auth via `sessionStorage`. Login screen. Spec list view showing owned + shared specs with completeness bar, status chip, owner, last-edited timestamp. "New spec" action creates a draft and navigates to the authoring view (stubbed until T-08).
+# T-07 — React SPA Scaffold + Spec List
 
-**Done when:** you can log in, see your specs, and create new ones.
+You are implementing ticket **T-07** in the Context MVP build plan. This ticket creates the frontend application and delivers the first usable surface: login, see your specs, create a new one. The authoring view (T-08) is stubbed here — clicking into a spec navigates to a placeholder that just displays the spec id and a "Coming soon" message.
+
+This ticket depends on T-01 (schema package for shared types), T-02 (backend `/health`), T-03 (auth), and T-04 (spec CRUD). If T-04a (sharing) has landed, this ticket picks up the "owned + shared" list distinction; if it hasn't, the list is owned-only and the work is trivially extended later.
+
+---
+
+## Repository layout — Context is its own repo
+
+Context lives at `github.com/derekrivers/context`, not inside RedDwarf. It is a standalone pnpm monorepo. RedDwarf is a consumer of Context's output (via the T-09 adapter and T-10 injection endpoint) — the two codebases are cleanly separated and have no shared packages.
+
+The original MVP plan said: "Same styling and component patterns as `packages/dashboard`." That was aspirational. `packages/dashboard` does not exist in RedDwarf — RedDwarf has no first-party React UI; its operator surface is the OpenClaw Control UI on port 3578 plus the operator HTTP API. There is nothing to mirror.
+
+This ticket establishes Context's frontend conventions from scratch. These become the canonical patterns for any future Context UI work (T-08's authoring view will follow them).
+
+---
+
+## Context — conventions to follow
+
+Read these from the Context repo before starting:
+
+- `pnpm-workspace.yaml` — the workspace glob. T-01 and T-02 should already have established `@context/spec-schema` and `@context/backend` as workspace packages. If not, confirm the package layout with the existing package `package.json` files before creating this one.
+- Root `tsconfig.base.json` (or equivalent) — reuse the existing TypeScript strict config. If one doesn't exist yet, create it as part of this ticket so the frontend and any later packages share a single base.
+- Root `eslint.config.js`, `.prettierrc.json`, `vitest.config.ts` — reuse if they exist; otherwise establish sensible defaults. Match whatever T-01/T-02 settled on.
+- `.env.example` at the repo root — canonical env key order. Any new env var goes here in the existing `CONTEXT_*` style with a comment.
+- `CLAUDE.md` / `AGENTS.md` at the repo root, if present.
+
+If any of these don't exist yet because T-01/T-02 didn't need them, create them as part of this ticket with sensible defaults. Do not invent conventions that contradict existing ones.
+
+---
+
+## Package placement
+
+Inside the Context repo, create:
+
+```
+packages/frontend/
+```
+
+Name it `@context/frontend` in `package.json`, matching the scheme already used by `@context/spec-schema` (at `packages/spec-schema`) and `@context/backend` (at `packages/backend`).
+
+---
+
+## Stack
+
+Fixed choices, not negotiable within this ticket:
+
+- **Vite** + **React 18** + **TypeScript strict**.
+- **Tailwind CSS** for styling. No CSS-in-JS, no CSS modules, no raw stylesheets beyond a minimal `index.css` that loads Tailwind and sets the base theme.
+- **shadcn/ui** as the component primitive library. Install via the CLI; components live in `src/components/ui/` and are owned by this repo (shadcn is copy-in, not a dependency).
+- **TanStack Query** for server state. Every API call goes through a query or mutation — no bare `fetch` in components.
+- **TanStack Router** for routing. File-based routes in `src/routes/`.
+- **Zod** for API response validation at the network boundary. Share types from `@context/spec-schema` where they exist; derive client-local types from backend DTOs otherwise.
+- **Vitest** + **@testing-library/react** for tests. Reuse the root `vitest.config.ts` setup.
+
+Port: **5174**. Configure in `vite.config.ts`. The backend is on 8180 (T-02); dev proxy `/api` → `http://127.0.0.1:8180`.
+
+Do not add: Redux, Zustand, Jotai, MobX, styled-components, Emotion, Material UI, Chakra, Ant Design, or any other state/styling library. TanStack Query + React's built-in state is the full toolkit.
+
+---
+
+## Auth model
+
+Bearer token stored in `sessionStorage` under the key `context.token`. This means the token is cleared when the tab closes — deliberate, because Context will run on laptops that are occasionally handed around and the cost of losing the session is one re-login.
+
+- **Login screen** (`/login`): single input for the token, a "Sign in" button, inline error message on 401. No registration — token provisioning is backend-only via `POST /users` (T-03).
+- **Token storage** happens in a single `auth.ts` module that owns `getToken()`, `setToken()`, `clearToken()`. No direct `sessionStorage` access anywhere else.
+- **API client** (`api.ts`) reads the token on every request, injects `Authorization: Bearer ...`, and on 401 calls `clearToken()` and redirects to `/login`.
+- **Route guards**: unauthenticated users hitting any route other than `/login` are redirected. Use TanStack Router's `beforeLoad` hook.
+- **Logout**: a button in the header. Clears token, clears TanStack Query cache, redirects to `/login`.
+
+No refresh tokens. No OAuth. No "remember me." The token the user pastes in is the token they use until it's rotated server-side via `POST /users/:id/rotate-token` (T-03).
+
+---
+
+## Routes
+
+```
+/login                  — login screen
+/specs                  — spec list (authenticated)
+/specs/new              — creates a draft via POST /specs, redirects to /specs/:id
+/specs/:id              — authoring view (stub in this ticket, real in T-08)
+```
+
+Default landing for an authenticated user is `/specs`. `/` redirects there when authenticated, to `/login` otherwise.
+
+---
+
+## Spec list view
+
+The primary deliverable of this ticket. Design for clarity and density, not flash.
+
+**Header bar:**
+- App title ("Context") on the left.
+- User's display name / id on the right, with a logout button.
+
+**Main area:**
+- Page title: "Your specs".
+- Primary action button: "New spec" (top-right of the list area). Calls `POST /specs`, redirects on success.
+- A list (not a grid) of specs. One spec per row.
+
+**Each row shows:**
+- **Title** — spec's `intent.summary` if present, else "Untitled spec". Clickable; navigates to `/specs/:id`.
+- **Completeness bar** — horizontal bar, width proportional to overall completeness score (0–100%). Use the computed value from the `GET /specs` response; if the backend doesn't surface it yet, call `computeCompleteness` from `@context/spec-schema` client-side on the summary payload.
+- **Status chip** — one of `draft`, `in_progress`, `complete`, `archived`. Small, coloured, unobtrusive.
+- **Owner** — if the spec is owned by the current user, show "You". Otherwise show the owner's display name.
+- **Access chip** — only shown for shared specs (when T-04a has landed): `viewer` or `editor`. Omit for owned specs.
+- **Last edited** — relative time ("2 hours ago"). Use a small helper, not a date library — no moment, no date-fns needed for one use case.
+
+**Empty state:** when the user has zero specs, show a centered message: "No specs yet. Create one to start." with the "New spec" button prominent.
+
+**Loading state:** a skeleton list of 3 rows. Don't show a spinner.
+
+**Error state:** inline error message with a retry button. Covers both network failures and 5xx responses.
+
+**Sort order:** most recently edited first. No sort controls in this ticket — add them when you have enough specs to need them.
+
+No pagination, no search, no filters in v0.1. A single developer will not have 200 specs.
+
+---
+
+## Stubbed authoring route
+
+`/specs/:id` in this ticket:
+
+- Loads the spec via `GET /specs/:id`.
+- Shows the spec title (from `intent.summary` or "Untitled spec") and id.
+- Shows a paragraph: "Authoring view coming soon (T-08). This spec exists in the backend and can be inspected via the API."
+- Has a "Back to specs" link.
+
+That's it. T-08 replaces this route entirely.
+
+---
+
+## API client
+
+A single `src/lib/api.ts` module. Thin wrapper around `fetch`:
+
+- `apiGet<T>(path, schema: z.ZodType<T>): Promise<T>` — validates response with Zod, throws on shape mismatch.
+- `apiPost<T>(path, body, schema)`, `apiPatch`, `apiDelete` similarly.
+- On non-2xx, throws a typed `ApiError` with status, message, and optional `code` from the response body.
+- On 401, clears the token and redirects. This is the only place auth is imported from a non-auth module — don't spread this logic.
+
+TanStack Query hooks live in `src/queries/` — one file per resource (`specs.ts`, `users.ts`, etc.). Components import hooks, never the raw API client.
+
+---
+
+## Directory layout
+
+```
+packages/frontend/
+├── package.json
+├── tsconfig.json               # extends ../../tsconfig.base.json
+├── vite.config.ts
+├── tailwind.config.ts
+├── postcss.config.js
+├── index.html
+├── src/
+│   ├── main.tsx                # React root + QueryClientProvider + RouterProvider
+│   ├── index.css               # Tailwind directives + base theme vars
+│   ├── lib/
+│   │   ├── auth.ts             # token get/set/clear
+│   │   ├── api.ts              # fetch wrapper
+│   │   └── time.ts             # relative time helper
+│   ├── queries/
+│   │   └── specs.ts            # useSpecs, useSpec, useCreateSpec
+│   ├── components/
+│   │   ├── ui/                 # shadcn components (button, input, etc.)
+│   │   ├── AppShell.tsx        # header + main layout
+│   │   ├── SpecRow.tsx
+│   │   ├── CompletenessBar.tsx
+│   │   └── StatusChip.tsx
+│   └── routes/                 # TanStack Router file-based routes
+│       ├── __root.tsx
+│       ├── login.tsx
+│       ├── specs.index.tsx
+│       ├── specs.new.tsx
+│       └── specs.$id.tsx
+└── vitest.config.ts            # extends root config, adds jsdom
+```
+
+Do not deviate from this layout without a reason you'd defend in a PR review. Consistency across Context packages matters more than any individual improvement.
+
+---
+
+## Styling notes
+
+Tailwind only. No arbitrary hex codes sprinkled through JSX — define a minimal palette in `tailwind.config.ts` using CSS variables:
+
+```
+--color-bg
+--color-bg-subtle
+--color-fg
+--color-fg-muted
+--color-border
+--color-accent
+--color-status-draft
+--color-status-in-progress
+--color-status-complete
+--color-status-archived
+```
+
+Pick sensible defaults (light theme only for v0.1 — dark mode is not scoped). Resist adding visual flourishes: no shadows beyond the default, no gradients, no animations beyond shadcn's built-ins. Context is a serious tool for a thinking task; the UI should recede.
+
+Typography: system font stack. `font-sans` from Tailwind's defaults is fine. No Google Fonts, no custom font loading.
+
+Accessibility: semantic HTML, visible focus rings, label every form input, every icon button has an `aria-label`. shadcn handles most of this out of the box — don't undo it.
+
+---
+
+## Env vars
+
+Add to root `.env.example` in canonical order with comments:
+
+```
+# -- Context frontend ---------------------------------------------------------
+CONTEXT_FRONTEND_PORT=5174
+CONTEXT_BACKEND_URL=http://127.0.0.1:8180
+```
+
+The frontend reads `CONTEXT_BACKEND_URL` via Vite's `import.meta.env.VITE_CONTEXT_BACKEND_URL` — expose it with the `VITE_` prefix in `vite.config.ts` using `define` or through Vite's standard env handling. Default to `http://127.0.0.1:8180` if unset.
+
+---
+
+## Tests
+
+Keep the test footprint small in this ticket — the payoff comes in T-08 when real logic lives in the frontend.
+
+Unit tests:
+- `auth.ts`: set/get/clear round-trips correctly.
+- `api.ts`: 401 triggers token clear and redirect (mock the router).
+- `api.ts`: response schema mismatch throws a typed error.
+- `time.ts`: relative time helper handles the edges (just now, minutes, hours, days, weeks).
+
+Component tests (React Testing Library):
+- `SpecRow`: renders title, completeness bar width, status chip, owner, access chip when present.
+- `CompletenessBar`: clamps to 0–100 on out-of-range input.
+- Spec list route: renders skeleton on loading, empty state on zero specs, list on success, error state on failure.
+
+No E2E tests in this ticket. Manual verification covers "can log in, see specs, create one."
+
+---
+
+## Done when
+
+- `pnpm --filter @context/frontend dev` boots the app on port 5174 with hot reload.
+- `pnpm --filter @context/frontend build` produces a clean production build with no type errors.
+- A user with a valid bearer token (issued via the T-03 `POST /users` endpoint) can:
+  1. Paste their token on `/login`, click Sign in.
+  2. Land on `/specs` and see their existing specs (or the empty state).
+  3. Click "New spec" and be redirected to `/specs/:id` showing the stub.
+  4. Click "Back to specs" and return to the list.
+  5. Click logout and be returned to `/login` with the token cleared.
+- Shared specs (if T-04a has landed) appear in the list with the correct access chip.
+- Invalid tokens surface as a clear error on the login screen.
+- 401 responses anywhere in the app clear the token and redirect to login.
+- The root `pnpm test` passes with the new tests included.
+- ESLint, Prettier, and `tsc --noEmit` pass cleanly.
+
+---
+
+## Non-negotiables
+
+- Tailwind only. No other styling system.
+- TanStack Query for every server interaction. No bare `fetch` in components.
+- `sessionStorage`, not `localStorage`. Token does not survive tab close.
+- Every API response validated with Zod at the network boundary.
+- TypeScript strict across every file.
+- No new runtime dependencies beyond what this ticket names. If you think you need one, stop and flag it.
+- No dark mode, no theming beyond the CSS-variable palette, no i18n, no animations beyond shadcn defaults.
+- File layout matches the spec above. No deviations without justification.
+
+---
+
+## Out of scope
+
+Flag and push back if asked to add any of these:
+
+- User registration UI (tokens are backend-issued).
+- Password login, OAuth, SSO.
+- Profile editing.
+- Multi-user presence indicators on the list.
+- Spec search, filtering, tagging, folders.
+- Pagination.
+- Dark mode.
+- Mobile-specific layouts — the list view being narrow-friendly is fine, but no responsive redesign work.
+- Any part of the authoring UI (three-pane layout, conversation pane, structured spec pane). That is T-08 and must not bleed into this ticket.
+- Admin views, user management, analytics.
+- Any direct dependency on the RedDwarf codebase. Context and RedDwarf are separate repos; the only integration between them is the T-09 adapter (which runs inside RedDwarf's pipeline, not Context's frontend) and the T-10 injection endpoint (which Context calls as an external HTTP service).
+
+---
+
+## Decisions deferred to you during implementation
+
+Flag these in the PR description:
+
+- Whether `shadcn` components are installed one-at-a-time as needed (leaner) or a standard starter set up front (faster scaffolding). Either is fine; be consistent.
+- Whether the completeness percentage is computed client-side from `computeCompleteness` (more accurate, adds bundle weight) or relied on from the backend list response (lighter client). I'd suggest backend by default; if the backend doesn't include it on the list endpoint yet, extend T-04's response shape rather than computing client-side.
+- The exact shade of the status-chip colours. Pick something muted; a future design pass will refine.
+- Whether to include a "copy spec id" affordance on the list row. Not required; mildly useful for debugging.
+
 
 ### T-08 — Three-pane authoring UI
 
