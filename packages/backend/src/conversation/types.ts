@@ -1,6 +1,13 @@
 import type { CanonicalSpec, Importance, SectionKey } from '@context/spec-schema'
 
-export type TurnPhase = 'selection' | 'answer' | 'clarification' | 'skip' | 'unskip'
+export type TurnPhase =
+  | 'selection'
+  | 'answer'
+  | 'clarification'
+  | 'skip'
+  | 'unskip'
+  | 'direct_edit'
+  | 'retry_request'
 
 export type TurnOutcome = 'answered' | 'clarification_requested' | 'skipped' | 'unparseable'
 

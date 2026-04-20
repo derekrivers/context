@@ -6,6 +6,7 @@ import { createLlmClient, type LlmClient } from './llm/client.js'
 import { registerHealthRoute } from './routes/health.js'
 import { specRoutes } from './routes/specs.js'
 import { turnRoutes } from './routes/turns.js'
+import { unresolvedRoutes } from './routes/unresolved.js'
 import { userRoutes } from './routes/users.js'
 
 export interface BuildServerOptions {
@@ -64,6 +65,7 @@ export async function buildServer({
     maxTurnsPerSpec: config.maxTurnsPerSpec,
     maxTokensPerSpec: config.maxTokensPerSpec,
   })
+  await app.register(unresolvedRoutes, { db })
 
   return app
 }

@@ -1,54 +1,224 @@
-import { createFileRoute, Link, redirect } from '@tanstack/react-router'
-import { ArrowLeft } from 'lucide-react'
+import { createFileRoute, redirect } from '@tanstack/react-router'
+import { useEffect, useMemo, useRef } from 'react'
 import { hasToken } from '../lib/auth.js'
-import { useSpec } from '../queries/specs.js'
-import { AppShell } from '../components/AppShell.js'
-import { Button } from '../components/ui/button.js'
+import {
+  useAcquireLock,
+  useLockState,
+  usePatchSpec,
+  useReleaseLock,
+  useSpecDetail,
+  useTurns,
+} from '../queries/authoring.js'
+import { AuthoringLayout } from '../components/authoring/AuthoringLayout.js'
+import { AuthoringHeader } from '../components/authoring/AuthoringHeader.js'
+import { LockBanner } from '../components/authoring/LockBanner.js'
+import { AccessBanner } from '../components/authoring/AccessBanner.js'
+import { ConversationPane } from '../components/authoring/ConversationPane.js'
+import { StructuredPane } from '../components/authoring/StructuredPane.js'
+import { ContextPane } from '../components/authoring/ContextPane.js'
+import {
+  AuthoringProvider,
+  AuthoringReadOnlyProvider,
+} from '../contexts/AuthoringContexts.js'
+import { useMe } from '../queries/specs.js'
 
 export const Route = createFileRoute('/specs/$id')({
   beforeLoad: () => {
     if (!hasToken()) throw redirect({ to: '/login' })
   },
-  component: SpecDetailRoute,
+  component: AuthoringRoute,
 })
 
-function SpecDetailRoute(): JSX.Element {
-  const { id } = Route.useParams()
-  const spec = useSpec(id)
+const LEASE_RENEWAL_MS = 2 * 60_000
 
-  const title =
-    spec.data?.spec.intent.summary && spec.data.spec.intent.summary.length > 0
-      ? spec.data.spec.intent.summary
-      : 'Untitled spec'
+function AuthoringRoute(): JSX.Element {
+  const { id } = Route.useParams()
+  const specQuery = useSpecDetail(id)
+  const lockQuery = useLockState(id)
+  const me = useMe()
+  const turnsQuery = useTurns(id)
+  const patchSpec = usePatchSpec(id)
+  const acquireLock = useAcquireLock(id)
+  const releaseLock = useReleaseLock(id)
+
+  const acquiredRef = useRef(false)
+  const access = specQuery.data?.access
+  const isViewer = access === 'viewer'
+  const canEdit = !isViewer
+
+  useEffect(() => {
+    if (!canEdit) return
+    if (acquiredRef.current) return
+    if (!specQuery.data) return
+    const lockedByOther =
+      lockQuery.data?.locked_by && lockQuery.data.locked_by !== me.data?.id
+    if (lockedByOther) return
+    acquiredRef.current = true
+    void acquireLock.mutateAsync().catch(() => {
+      acquiredRef.current = false
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit, specQuery.data?.id, lockQuery.data?.locked_by, me.data?.id])
+
+  useEffect(() => {
+    if (!canEdit) return
+    const holder = lockQuery.data?.locked_by
+    const meId = me.data?.id
+    if (!holder || holder !== meId) return
+    let timer: ReturnType<typeof setInterval> | null = null
+    const start = (): void => {
+      if (timer) return
+      timer = setInterval(() => {
+        void acquireLock.mutateAsync().catch(() => {})
+      }, LEASE_RENEWAL_MS)
+    }
+    const stop = (): void => {
+      if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') start()
+      else stop()
+    }
+    if (document.visibilityState === 'visible') start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit, lockQuery.data?.locked_by, me.data?.id])
+
+  useEffect(() => {
+    if (!canEdit) return
+    const holder = lockQuery.data?.locked_by
+    const meId = me.data?.id
+    const releaseOnUnload = (): void => {
+      if (holder === meId) {
+        try {
+          const headers: Record<string, string> = {}
+          const token = window.sessionStorage.getItem('context.token')
+          if (token) headers.Authorization = `Bearer ${token}`
+          fetch(`/api/specs/${id}/lock`, {
+            method: 'DELETE',
+            headers,
+            keepalive: true,
+          }).catch(() => {})
+        } catch {
+          /* noop */
+        }
+      }
+    }
+    window.addEventListener('beforeunload', releaseOnUnload)
+    return () => {
+      window.removeEventListener('beforeunload', releaseOnUnload)
+      if (holder === meId) {
+        void releaseLock.mutateAsync().catch(() => {})
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit, id, lockQuery.data?.locked_by, me.data?.id])
+
+  const readOnlyValue = useMemo(() => {
+    if (isViewer) return { readOnly: true, reason: 'viewer_share' as const }
+    const holder = lockQuery.data?.locked_by
+    if (holder && holder !== me.data?.id) {
+      return { readOnly: true, reason: 'locked_by_other' as const }
+    }
+    return { readOnly: false, reason: null }
+  }, [isViewer, lockQuery.data?.locked_by, me.data?.id])
+
+  const latestSelection = useMemo(() => {
+    const turns = turnsQuery.data?.turns ?? []
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i]!
+      if (t.phase === 'selection') return t
+    }
+    return null
+  }, [turnsQuery.data])
+
+  const authoringValue = useMemo(
+    () => ({
+      activeTargetPath: latestSelection?.target_path ?? null,
+      activeSection: latestSelection?.target_section ?? null,
+      activeSelectionTurnId: latestSelection?.id ?? null,
+    }),
+    [latestSelection?.id, latestSelection?.target_path, latestSelection?.target_section],
+  )
+
+  const header = (
+    <>
+      <AuthoringHeader
+        spec={specQuery.data}
+        onTitleChange={async (title) => {
+          if (!specQuery.data) return
+          if (title === specQuery.data.title) return
+          await patchSpec.mutateAsync({ title: title.length > 0 ? title : 'Untitled spec' })
+        }}
+      />
+      {me.data ? (
+        <LockBanner
+          lockState={
+            lockQuery.data ?? {
+              spec_id: id,
+              locked_by: null,
+              lock_expires_at: null,
+              held_by_caller: false,
+              holder: null,
+            }
+          }
+          currentUserId={me.data.id}
+        />
+      ) : null}
+      <AccessBanner
+        access={access}
+        ownerDisplay={specQuery.data?.owner_id.slice(0, 8) ?? 'the owner'}
+      />
+    </>
+  )
 
   return (
-    <AppShell>
-      <div className="mb-4">
-        <Button asChild variant="ghost" size="sm">
-          <Link to="/specs">
-            <ArrowLeft className="mr-1 h-4 w-4" aria-hidden="true" />
-            Back to specs
-          </Link>
-        </Button>
-      </div>
-      {spec.isLoading ? (
-        <div className="h-32 w-full animate-pulse rounded-md bg-bg-subtle" />
-      ) : spec.isError ? (
-        <div className="rounded-md border border-red-300 bg-red-50 p-4 text-sm text-red-900">
-          Could not load this spec.
-        </div>
-      ) : spec.data ? (
-        <div className="flex flex-col gap-4">
-          <div>
-            <h1 className="text-xl font-semibold">{title}</h1>
-            <p className="mt-1 font-mono text-xs text-fg-muted">{spec.data.id}</p>
-          </div>
-          <p className="rounded-md border border-dashed border-border bg-bg-subtle/30 p-4 text-sm text-fg-muted">
-            Authoring view coming soon (T-08). This spec exists in the backend and
-            can be inspected via the API.
-          </p>
-        </div>
-      ) : null}
-    </AppShell>
+    <AuthoringReadOnlyProvider value={readOnlyValue}>
+      <AuthoringProvider value={authoringValue}>
+        <AuthoringLayout
+          header={header}
+          conversation={<ConversationPane specId={id} />}
+          structured={<StructuredPane specId={id} />}
+          context={
+            <ContextPane
+              specId={id}
+              onExport={() => {
+                if (!specQuery.data) return
+                const date = new Date().toISOString().slice(0, 10)
+                const filename = `${specQuery.data.id}-${date}.json`
+                const blob = new Blob(
+                  [JSON.stringify(specQuery.data.spec, null, 2)],
+                  { type: 'application/json' },
+                )
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = filename
+                document.body.appendChild(a)
+                a.click()
+                a.remove()
+                URL.revokeObjectURL(url)
+              }}
+              onJumpConversation={() => {
+                const input = document.querySelector<HTMLTextAreaElement>(
+                  'textarea[aria-label="Your answer"]',
+                )
+                input?.focus()
+              }}
+              onNavigateToPath={() => {
+                // anchor-based scroll is a future refinement; stubbed for now
+              }}
+            />
+          }
+        />
+      </AuthoringProvider>
+    </AuthoringReadOnlyProvider>
   )
 }

@@ -86,7 +86,7 @@ export const conversationTurns = contextSchema.table(
     turnIndex: integer('turn_index').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     phase: text('phase', {
-      enum: ['selection', 'answer', 'clarification', 'skip', 'unskip'],
+      enum: ['selection', 'answer', 'clarification', 'skip', 'unskip', 'direct_edit', 'retry_request'],
     }).notNull(),
     targetPath: text('target_path'),
     targetSection: text('target_section'),
@@ -97,6 +97,8 @@ export const conversationTurns = contextSchema.table(
     llmModelId: text('llm_model_id'),
     llmTokensIn: integer('llm_tokens_in'),
     llmTokensOut: integer('llm_tokens_out'),
+    questionText: text('question_text'),
+    userText: text('user_text'),
   },
   (t) => ({
     specTurnUnique: unique('conversation_turns_spec_turn_unique').on(t.specId, t.turnIndex),

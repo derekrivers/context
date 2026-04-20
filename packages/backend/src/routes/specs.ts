@@ -1,4 +1,4 @@
-import { and, desc, eq, isNotNull, or } from 'drizzle-orm'
+import { and, asc, desc, eq, isNotNull, or } from 'drizzle-orm'
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import {
@@ -11,6 +11,7 @@ import {
 } from '@context/spec-schema'
 import type { Db } from '../db/pool.js'
 import {
+  conversationTurns,
   specHistory,
   specShares,
   specs,
@@ -335,6 +336,41 @@ export const specRoutes: FastifyPluginAsync<SpecRoutesOptions> = async (
       createdAt: now,
     })
 
+    // direct_edit turn per changed path (excluding server-managed meta fields)
+    const META_FIELDS = new Set(['updated_at', 'created_at', 'id', 'schema_version'])
+    const changedPaths = diff.changes
+      .map((c) => c.path)
+      .filter((p) => p !== '$' && !META_FIELDS.has(p))
+    if (changedPaths.length > 0) {
+      const report = computeCompleteness(nextSpec)
+      const bySection: Record<string, number> = {}
+      for (const [k, v] of Object.entries(report.bySection)) bySection[k] = v.score
+      const completenessSnapshot = { overall: report.overall, by_section: bySection }
+
+      const existing = await db.client
+        .select({ turnIndex: conversationTurns.turnIndex })
+        .from(conversationTurns)
+        .where(eq(conversationTurns.specId, nextRow.id))
+        .orderBy(asc(conversationTurns.turnIndex))
+      let nextIndex = existing.length === 0 ? 0 : existing[existing.length - 1]!.turnIndex + 1
+
+      for (const path of changedPaths) {
+        const section = path.split(/[.[]/)[0] ?? ''
+        await db.client.insert(conversationTurns).values({
+          specId: nextRow.id,
+          turnIndex: nextIndex,
+          phase: 'direct_edit',
+          targetPath: path,
+          targetSection: section,
+          outcome: 'answered',
+          specSnapshot: nextSpec,
+          completenessSnapshot,
+          createdAt: now,
+        })
+        nextIndex += 1
+      }
+    }
+
     reply.send(serializeSpec(nextRow))
   })
 
@@ -417,6 +453,68 @@ export const specRoutes: FastifyPluginAsync<SpecRoutesOptions> = async (
       lock_expires_at: nextRow.lockExpiresAt?.toISOString() ?? null,
       lock_ttl_ms: LOCK_TTL_MS,
     })
+  })
+
+  app.get('/specs/:id/lock', { preHandler: [app.requireAuth] }, async (req, reply) => {
+    const user = requireUserOr400(req, reply)
+    if (!user) return
+
+    const params = SpecIdParams.safeParse(req.params)
+    if (!params.success) {
+      reply.code(400).send({ error: 'invalid id' })
+      return
+    }
+
+    const result = await loadSpecWithAccess(db, params.data.id, user.id)
+    if (!result) {
+      reply.code(404).send({ error: 'not found' })
+      return
+    }
+
+    const row = result.spec
+    const now = nowFn()
+    const expired =
+      row.lockExpiresAt === null || row.lockExpiresAt.getTime() <= now.getTime()
+    const heldBy = expired ? null : row.lockedBy
+    const holder = await loadUser(db, heldBy)
+
+    reply.send({
+      spec_id: row.id,
+      locked_by: heldBy,
+      lock_expires_at: expired ? null : row.lockExpiresAt?.toISOString() ?? null,
+      held_by_caller: heldBy === user.id,
+      holder: holder ? { id: holder.id, name: holder.name } : null,
+    })
+  })
+
+  app.delete('/specs/:id/lock', { preHandler: [app.requireAuth] }, async (req, reply) => {
+    const user = requireUserOr400(req, reply)
+    if (!user) return
+
+    const params = SpecIdParams.safeParse(req.params)
+    if (!params.success) {
+      reply.code(400).send({ error: 'invalid id' })
+      return
+    }
+
+    const result = await loadSpecWithAccess(db, params.data.id, user.id)
+    if (!result) {
+      reply.code(404).send({ error: 'not found' })
+      return
+    }
+
+    const row = result.spec
+    if (row.lockedBy !== user.id) {
+      reply.code(409).send({ error: 'lock not held by caller' })
+      return
+    }
+
+    await db.client
+      .update(specs)
+      .set({ lockedBy: null, lockExpiresAt: null })
+      .where(eq(specs.id, row.id))
+
+    reply.code(204).send()
   })
 
   app.post('/specs/:id/shares', { preHandler: [app.requireAuth] }, async (req, reply) => {
